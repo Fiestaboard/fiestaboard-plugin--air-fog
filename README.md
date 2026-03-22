@@ -1,6 +1,6 @@
 # Air Quality & Fog Plugin
 
-![Air Quality & Fog Display](./docs/air-fog-display.png)
+![Air Quality & Fog Display](./docs/board-display.png)
 
 Display air quality index (AQI), fog/visibility conditions, and pollen/allergen levels.
 

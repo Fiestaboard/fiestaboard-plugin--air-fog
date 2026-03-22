@@ -12,49 +12,218 @@
   "settings_schema": {
     "type": "object",
     "properties": {
-      "enabled": {"type": "boolean", "title": "Enable Air Quality & Fog", "default": false},
-      "purpleair_api_key": {"type": "string", "title": "PurpleAir API Key", "description": "API key for air quality data", "ui:widget": "password"},
-      "openweathermap_api_key": {"type": "string", "title": "OpenWeatherMap API Key", "description": "API key for visibility/fog data", "ui:widget": "password"},
-      "purpleair_sensor_id": {"type": "string", "title": "PurpleAir Sensor ID", "description": "Optional: Specific sensor ID (otherwise uses nearby sensors)"},
-      "latitude": {"type": "number", "title": "Latitude", "description": "Location latitude", "default": 37.7749},
-      "longitude": {"type": "number", "title": "Longitude", "description": "Location longitude", "default": -122.4194},
-      "refresh_seconds": {"type": "integer", "title": "Refresh Interval (seconds)", "default": 300, "minimum": 60}
+      "enabled": {
+        "type": "boolean",
+        "title": "Enable Air Quality & Fog",
+        "default": false
+      },
+      "purpleair_api_key": {
+        "type": "string",
+        "title": "PurpleAir API Key",
+        "description": "API key for air quality data",
+        "ui:widget": "password"
+      },
+      "openweathermap_api_key": {
+        "type": "string",
+        "title": "OpenWeatherMap API Key",
+        "description": "API key for visibility/fog data",
+        "ui:widget": "password"
+      },
+      "purpleair_sensor_id": {
+        "type": "string",
+        "title": "PurpleAir Sensor ID",
+        "description": "Optional: Specific sensor ID (otherwise uses nearby sensors)"
+      },
+      "latitude": {
+        "type": "number",
+        "title": "Latitude",
+        "description": "Location latitude",
+        "default": 37.7749
+      },
+      "longitude": {
+        "type": "number",
+        "title": "Longitude",
+        "description": "Location longitude",
+        "default": -122.4194
+      },
+      "refresh_seconds": {
+        "type": "integer",
+        "title": "Refresh Interval (seconds)",
+        "default": 300,
+        "minimum": 60
+      }
     }
   },
   "env_vars": [
-    {"name": "PURPLEAIR_API_KEY", "required": false, "description": "PurpleAir API key for air quality"},
-    {"name": "OPENWEATHERMAP_API_KEY", "required": false, "description": "OpenWeatherMap API key for visibility"},
-    {"name": "PURPLEAIR_SENSOR_ID", "required": false, "description": "Optional specific PurpleAir sensor ID"},
-    {"name": "AIR_FOG_LATITUDE", "required": false, "description": "Location latitude", "default": "37.7749"},
-    {"name": "AIR_FOG_LONGITUDE", "required": false, "description": "Location longitude", "default": "-122.4194"}
+    {
+      "name": "PURPLEAIR_API_KEY",
+      "required": false,
+      "description": "PurpleAir API key for air quality"
+    },
+    {
+      "name": "OPENWEATHERMAP_API_KEY",
+      "required": false,
+      "description": "OpenWeatherMap API key for visibility"
+    },
+    {
+      "name": "PURPLEAIR_SENSOR_ID",
+      "required": false,
+      "description": "Optional specific PurpleAir sensor ID"
+    },
+    {
+      "name": "AIR_FOG_LATITUDE",
+      "required": false,
+      "description": "Location latitude",
+      "default": "37.7749"
+    },
+    {
+      "name": "AIR_FOG_LONGITUDE",
+      "required": false,
+      "description": "Location longitude",
+      "default": "-122.4194"
+    }
   ],
   "variables": {
     "groups": {
-      "air_quality": {"label": "Air Quality"},
-      "visibility": {"label": "Visibility & Fog"},
-      "grass": {"label": "Grass Pollen"},
-      "tree": {"label": "Tree Pollen"},
-      "weed": {"label": "Weed Pollen"},
-      "display": {"label": "Display"}
+      "air_quality": {
+        "label": "Air Quality"
+      },
+      "visibility": {
+        "label": "Visibility & Fog"
+      },
+      "grass": {
+        "label": "Grass Pollen"
+      },
+      "tree": {
+        "label": "Tree Pollen"
+      },
+      "weed": {
+        "label": "Weed Pollen"
+      },
+      "display": {
+        "label": "Display"
+      }
     },
     "simple": {
-      "aqi": {"description": "US Air Quality Index value", "type": "number", "max_length": 3, "group": "air_quality", "example": "45"},
-      "air_status": {"description": "Air quality status text (e.g., Good, Moderate, Unhealthy)", "type": "string", "max_length": 18, "group": "air_quality", "example": "Good"},
-      "air_color": {"description": "Color code for air quality level", "type": "string", "max_length": 4, "group": "air_quality", "example": "{63}"},
-      "fog_status": {"description": "Fog/visibility status text", "type": "string", "max_length": 10, "group": "visibility", "example": "Clear"},
-      "fog_color": {"description": "Color code for fog status", "type": "string", "max_length": 4, "group": "visibility", "example": "{63}"},
-      "is_foggy": {"description": "Whether fog is present (Yes/No)", "type": "boolean", "max_length": 3, "group": "visibility", "example": "No"},
-      "visibility": {"description": "Visibility distance in miles", "type": "number", "max_length": 5, "group": "visibility", "example": "10.0"},
-      "grass_pollen": {"description": "Grass pollen count", "type": "number", "max_length": 6, "group": "grass", "example": "42"},
-      "grass_pollen_level": {"description": "Grass pollen risk level", "type": "string", "max_length": 9, "group": "grass", "example": "Moderate"},
-      "grass_pollen_color": {"description": "Color code for grass pollen level", "type": "string", "max_length": 4, "group": "grass", "example": "{63}"},
-      "tree_pollen": {"description": "Tree pollen count", "type": "number", "max_length": 6, "group": "tree", "example": "18"},
-      "tree_pollen_level": {"description": "Tree pollen risk level", "type": "string", "max_length": 9, "group": "tree", "example": "Low"},
-      "tree_pollen_color": {"description": "Color code for tree pollen level", "type": "string", "max_length": 4, "group": "tree", "example": "{63}"},
-      "weed_pollen": {"description": "Weed pollen count", "type": "number", "max_length": 6, "group": "weed", "example": "7"},
-      "weed_pollen_level": {"description": "Weed pollen risk level", "type": "string", "max_length": 9, "group": "weed", "example": "Low"},
-      "weed_pollen_color": {"description": "Color code for weed pollen level", "type": "string", "max_length": 4, "group": "weed", "example": "{63}"},
-      "formatted": {"description": "Pre-formatted air quality and fog summary", "type": "string", "max_length": 66, "group": "display", "example": "AQI:45 Good | Clear"}
+      "aqi": {
+        "description": "US Air Quality Index value",
+        "type": "number",
+        "max_length": 3,
+        "group": "air_quality",
+        "example": "45"
+      },
+      "air_status": {
+        "description": "Air quality status text (e.g., Good, Moderate, Unhealthy)",
+        "type": "string",
+        "max_length": 18,
+        "group": "air_quality",
+        "example": "Good"
+      },
+      "air_color": {
+        "description": "Color code for air quality level",
+        "type": "string",
+        "max_length": 4,
+        "group": "air_quality",
+        "example": "{63}"
+      },
+      "fog_status": {
+        "description": "Fog/visibility status text",
+        "type": "string",
+        "max_length": 10,
+        "group": "visibility",
+        "example": "Clear"
+      },
+      "fog_color": {
+        "description": "Color code for fog status",
+        "type": "string",
+        "max_length": 4,
+        "group": "visibility",
+        "example": "{63}"
+      },
+      "is_foggy": {
+        "description": "Whether fog is present (Yes/No)",
+        "type": "boolean",
+        "max_length": 3,
+        "group": "visibility",
+        "example": "No"
+      },
+      "visibility": {
+        "description": "Visibility distance in miles",
+        "type": "number",
+        "max_length": 5,
+        "group": "visibility",
+        "example": "10.0"
+      },
+      "grass_pollen": {
+        "description": "Grass pollen count",
+        "type": "number",
+        "max_length": 6,
+        "group": "grass",
+        "example": "42"
+      },
+      "grass_pollen_level": {
+        "description": "Grass pollen risk level",
+        "type": "string",
+        "max_length": 9,
+        "group": "grass",
+        "example": "Moderate"
+      },
+      "grass_pollen_color": {
+        "description": "Color code for grass pollen level",
+        "type": "string",
+        "max_length": 4,
+        "group": "grass",
+        "example": "{63}"
+      },
+      "tree_pollen": {
+        "description": "Tree pollen count",
+        "type": "number",
+        "max_length": 6,
+        "group": "tree",
+        "example": "18"
+      },
+      "tree_pollen_level": {
+        "description": "Tree pollen risk level",
+        "type": "string",
+        "max_length": 9,
+        "group": "tree",
+        "example": "Low"
+      },
+      "tree_pollen_color": {
+        "description": "Color code for tree pollen level",
+        "type": "string",
+        "max_length": 4,
+        "group": "tree",
+        "example": "{63}"
+      },
+      "weed_pollen": {
+        "description": "Weed pollen count",
+        "type": "number",
+        "max_length": 6,
+        "group": "weed",
+        "example": "7"
+      },
+      "weed_pollen_level": {
+        "description": "Weed pollen risk level",
+        "type": "string",
+        "max_length": 9,
+        "group": "weed",
+        "example": "Low"
+      },
+      "weed_pollen_color": {
+        "description": "Color code for weed pollen level",
+        "type": "string",
+        "max_length": 4,
+        "group": "weed",
+        "example": "{63}"
+      },
+      "formatted": {
+        "description": "Pre-formatted air quality and fog summary",
+        "type": "string",
+        "max_length": 66,
+        "group": "display",
+        "example": "AQI:45 Good | Clear"
+      }
     }
   },
   "color_rules_schema": {
@@ -62,14 +231,46 @@
       "type": "threshold",
       "description": "Color based on AQI level",
       "default_rules": [
-        {"condition": ">", "value": 300, "color": "violet"},
-        {"condition": ">", "value": 200, "color": "violet"},
-        {"condition": ">", "value": 150, "color": "red"},
-        {"condition": ">", "value": 100, "color": "orange"},
-        {"condition": ">", "value": 50, "color": "yellow"},
-        {"condition": "<=", "value": 50, "color": "green"}
+        {
+          "condition": ">",
+          "value": 300,
+          "color": "violet"
+        },
+        {
+          "condition": ">",
+          "value": 200,
+          "color": "violet"
+        },
+        {
+          "condition": ">",
+          "value": 150,
+          "color": "red"
+        },
+        {
+          "condition": ">",
+          "value": 100,
+          "color": "orange"
+        },
+        {
+          "condition": ">",
+          "value": 50,
+          "color": "yellow"
+        },
+        {
+          "condition": "<=",
+          "value": 50,
+          "color": "green"
+        }
       ]
     }
   },
-  "fiestaboard_version": ">=2.10.0"
+  "fiestaboard_version": ">=2.10.0",
+  "screenshots": [
+    {
+      "src": "docs/board-display.png",
+      "alt": "Air Quality & Fog displayed on a Vestaboard",
+      "caption": "Display air quality (AQI), fog/visibility conditions, and pollen/allergen levels",
+      "primary": true
+    }
+  ]
 }

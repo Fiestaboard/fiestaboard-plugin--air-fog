@@ -1,6 +1,8 @@
 """Tests for air quality and fog data source."""
 
+import json
 import pytest
+from pathlib import Path
 from unittest.mock import Mock, patch
 from src.utils.air_fog import (
     AirFogSource,
@@ -1294,4 +1296,77 @@ class TestPollenFetch:
         assert result is not None
         assert result["grass_pollen"] == 50.0
         assert result["grass_pollen_level"] == "MODERATE"
+
+
+MANIFEST_PATH = Path(__file__).resolve().parent.parent / "manifest.json"
+
+REQUIRED_VAR_FIELDS = {"description", "type", "max_length", "group", "example"}
+
+EXPECTED_SIMPLE_VARS = [
+    "aqi", "air_status", "air_color",
+    "fog_status", "fog_color", "is_foggy", "visibility",
+    "grass_pollen", "grass_pollen_level", "grass_pollen_color",
+    "tree_pollen", "tree_pollen_level", "tree_pollen_color",
+    "weed_pollen", "weed_pollen_level", "weed_pollen_color",
+    "formatted",
+]
+
+
+class TestManifestMetadata:
+    """Validate the rich variable metadata in manifest.json."""
+
+    @pytest.fixture(autouse=True)
+    def load_manifest(self):
+        with open(MANIFEST_PATH) as f:
+            self.manifest = json.load(f)
+        self.variables = self.manifest["variables"]
+        self.simple = self.variables["simple"]
+        self.groups = self.variables["groups"]
+
+    def test_required_top_level_fields(self):
+        for field in ("id", "name", "version"):
+            assert field in self.manifest
+
+    def test_simple_is_dict(self):
+        assert isinstance(self.simple, dict), "variables.simple must be a dict, not a list"
+
+    def test_expected_variable_count(self):
+        assert len(self.simple) == 17
+
+    def test_all_expected_vars_present(self):
+        assert set(self.simple.keys()) == set(EXPECTED_SIMPLE_VARS)
+
+    def test_each_variable_has_required_fields(self):
+        for var_name, meta in self.simple.items():
+            missing = REQUIRED_VAR_FIELDS - set(meta.keys())
+            assert not missing, f"{var_name} missing fields: {missing}"
+
+    def test_groups_section_exists(self):
+        assert isinstance(self.groups, dict)
+        assert len(self.groups) >= 1
+
+    def test_every_variable_references_valid_group(self):
+        for var_name, meta in self.simple.items():
+            assert meta["group"] in self.groups, (
+                f"{var_name} references unknown group '{meta['group']}'"
+            )
+
+    def test_max_length_is_positive_int(self):
+        for var_name, meta in self.simple.items():
+            ml = meta["max_length"]
+            assert isinstance(ml, int) and ml > 0, (
+                f"{var_name}: max_length must be a positive int, got {ml}"
+            )
+
+    def test_type_values_are_valid(self):
+        allowed = {"string", "number", "boolean"}
+        for var_name, meta in self.simple.items():
+            assert meta["type"] in allowed, (
+                f"{var_name}: invalid type '{meta['type']}'"
+            )
+
+    def test_no_old_max_lengths_key(self):
+        assert "max_lengths" not in self.manifest, (
+            "Old top-level max_lengths key should be removed"
+        )
 

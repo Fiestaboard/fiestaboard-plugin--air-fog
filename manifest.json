@@ -1,7 +1,7 @@
 {
   "id": "air_fog",
   "name": "Air Quality & Fog",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Display air quality (AQI), fog/visibility conditions, and pollen/allergen levels",
   "author": "FiestaBoard Team",
   "repository": "https://github.com/Fiestaboard/fiestaboard-plugin--air-fog",
@@ -272,5 +272,43 @@
       "caption": "Display air quality (AQI), fog/visibility conditions, and pollen/allergen levels",
       "primary": true
     }
-  ]
+  ],
+  "demo": {
+    "name": "Air Quality & Fog Demo",
+    "device_type": "flagship",
+    "template": [
+      "Air Quality",
+      "AQI {{air_fog.aqi}} {{air_fog.air_color}}",
+      "{{air_fog.air_status}}",
+      "Fog {{air_fog.fog_status}}",
+      "Vis {{air_fog.visibility}} mi",
+      "{{air_fog.formatted}}"
+    ],
+    "line_metadata": [
+      {
+        "alignment": "center",
+        "wrap": false
+      },
+      {
+        "alignment": "center",
+        "wrap": false
+      },
+      {
+        "alignment": "center",
+        "wrap": false
+      },
+      {
+        "alignment": "center",
+        "wrap": false
+      },
+      {
+        "alignment": "center",
+        "wrap": false
+      },
+      {
+        "alignment": "center",
+        "wrap": false
+      }
+    ]
+  }
 }

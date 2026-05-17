@@ -1,7 +1,7 @@
 {
   "id": "air_fog",
   "name": "Air Quality & Fog",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Display air quality (AQI), fog/visibility conditions, and pollen/allergen levels",
   "author": "FiestaBoard Team",
   "repository": "https://github.com/Fiestaboard/fiestaboard-plugin--air-fog",
@@ -274,41 +274,64 @@
     }
   ],
   "demo": {
-    "name": "Air Quality & Fog Demo",
-    "device_type": "flagship",
-    "template": [
-      "Air Quality",
-      "AQI {{air_fog.aqi}} {{air_fog.air_color}}",
-      "{{air_fog.air_status}}",
-      "Fog {{air_fog.fog_status}}",
-      "Vis {{air_fog.visibility}} mi",
-      "{{air_fog.formatted}}"
-    ],
-    "line_metadata": [
-      {
-        "alignment": "center",
-        "wrap": false
-      },
-      {
-        "alignment": "center",
-        "wrap": false
-      },
-      {
-        "alignment": "center",
-        "wrap": false
-      },
-      {
-        "alignment": "center",
-        "wrap": false
-      },
-      {
-        "alignment": "center",
-        "wrap": false
-      },
-      {
-        "alignment": "center",
-        "wrap": false
-      }
-    ]
+    "flagship": {
+      "name": "Air Quality & Fog Demo",
+      "template": [
+        "Air Quality",
+        "AQI {{air_fog.aqi}} {{air_fog.air_color}}",
+        "{{air_fog.air_status}}",
+        "Fog {{air_fog.fog_status}}",
+        "Vis {{air_fog.visibility}} mi",
+        "{{air_fog.formatted}}"
+      ],
+      "line_metadata": [
+        {
+          "alignment": "center",
+          "wrap": false
+        },
+        {
+          "alignment": "center",
+          "wrap": false
+        },
+        {
+          "alignment": "center",
+          "wrap": false
+        },
+        {
+          "alignment": "center",
+          "wrap": false
+        },
+        {
+          "alignment": "center",
+          "wrap": false
+        },
+        {
+          "alignment": "center",
+          "wrap": false
+        }
+      ]
+    },
+    "note": {
+      "name": "Air Quality (Note)",
+      "template": [
+        "AIR QUALITY",
+        "AQI {{air_fog.aqi}}{{air_fog.air_color}}",
+        "FOG {{air_fog.fog_status}}"
+      ],
+      "line_metadata": [
+        {
+          "alignment": "left",
+          "wrap": false
+        },
+        {
+          "alignment": "left",
+          "wrap": false
+        },
+        {
+          "alignment": "left",
+          "wrap": false
+        }
+      ]
+    }
   }
 }

@@ -1,7 +1,7 @@
 {
   "id": "air_fog",
   "name": "Air Quality & Fog",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Display air quality (AQI), fog/visibility conditions, and pollen/allergen levels",
   "author": "FiestaBoard Team",
   "repository": "https://github.com/Fiestaboard/fiestaboard-plugin--air-fog",

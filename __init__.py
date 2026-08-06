@@ -15,6 +15,17 @@ logger = logging.getLogger(__name__)
 # Open-Meteo Air Quality API (free, no key required)
 OPEN_METEO_AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
+# PurpleAir API
+PURPLEAIR_SENSORS_URL = "https://api.purpleair.com/v1/sensors"
+PURPLEAIR_PM25_FIELD = "pm2.5_10minute"
+PURPLEAIR_PM25_FALLBACK_FIELD = "pm2.5"
+PURPLEAIR_BBOX_DEGREES = 0.05
+PURPLEAIR_MAX_AGE_SECONDS = 3600
+
+# A consumer sensor reading above this is a parsing error, not weather. Guards
+# against silently reporting a fabricated AQI if the response shape changes.
+MAX_PLAUSIBLE_PM25 = 1000.0
+
 
 class AirFogPlugin(PluginBase):
     """Air Quality, Fog, and Allergen data plugin.
@@ -93,7 +104,12 @@ class AirFogPlugin(PluginBase):
         """Calculate AQI from PM2.5 concentration."""
         if pm25 < 0:
             pm25 = 0
-        
+
+        # EPA truncates PM2.5 to one decimal place before applying the table.
+        # Without this, an averaged reading landing between two breakpoints
+        # (e.g. 35.45) matches no band and falls through to the 500 fallback.
+        pm25 = math.floor(pm25 * 10) / 10
+
         for bp_low, bp_high, aqi_low, aqi_high, category, color in AirFogPlugin.AQI_BREAKPOINTS:
             if bp_low <= pm25 <= bp_high:
                 aqi = round(
@@ -138,59 +154,138 @@ class AirFogPlugin(PluginBase):
         else:
             return "GOOD", "GREEN"
     
+    @staticmethod
+    def _pm25_column(fields: List[str]) -> Optional[int]:
+        """Find the PM2.5 column in a PurpleAir ``fields`` array.
+
+        PurpleAir prepends ``sensor_index`` to whatever fields you request, and
+        the API docs warn that column order may change as columns are added, so
+        the column is always resolved by name rather than by position.
+        """
+        for name in (PURPLEAIR_PM25_FIELD, PURPLEAIR_PM25_FALLBACK_FIELD):
+            if name in fields:
+                return fields.index(name)
+        return None
+
+    def _fetch_single_sensor_pm25(
+        self, sensor_id: str, read_key: Optional[str], headers: Dict[str, str]
+    ) -> Optional[float]:
+        """Fetch PM2.5 for one specific sensor."""
+        params = {}
+        if read_key:
+            params["read_key"] = read_key
+
+        # ``fields`` is optional on this endpoint, and the running averages are
+        # only exposed through the stats object here, so request the default
+        # payload rather than asking for a field name this endpoint may reject.
+        response = requests.get(
+            f"{PURPLEAIR_SENSORS_URL}/{sensor_id}",
+            params=params,
+            headers=headers,
+            timeout=10,
+        )
+        response.raise_for_status()
+        sensor = response.json().get("sensor") or {}
+
+        for source in (sensor.get("stats") or {}, sensor):
+            for field in (PURPLEAIR_PM25_FIELD, PURPLEAIR_PM25_FALLBACK_FIELD):
+                value = source.get(field)
+                if value is not None:
+                    return float(value)
+
+        logger.warning("PurpleAir sensor %s returned no PM2.5 reading", sensor_id)
+        return None
+
+    def _fetch_nearby_sensors_pm25(
+        self, lat: float, lon: float, read_key: Optional[str], headers: Dict[str, str]
+    ) -> Optional[float]:
+        """Fetch PM2.5 averaged across sensors in a box around lat/lon."""
+        params = {
+            "fields": PURPLEAIR_PM25_FIELD,
+            "location_type": 0,
+            "max_age": PURPLEAIR_MAX_AGE_SECONDS,
+            "nwlat": lat + PURPLEAIR_BBOX_DEGREES,
+            "nwlng": lon - PURPLEAIR_BBOX_DEGREES,
+            "selat": lat - PURPLEAIR_BBOX_DEGREES,
+            "selng": lon + PURPLEAIR_BBOX_DEGREES,
+        }
+        if read_key:
+            params["read_keys"] = read_key
+
+        response = requests.get(
+            PURPLEAIR_SENSORS_URL, params=params, headers=headers, timeout=10
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        rows = payload.get("data") or []
+        if not rows:
+            logger.warning("No PurpleAir sensors found near %s,%s", lat, lon)
+            return None
+
+        fields = payload.get("fields") or []
+        column = self._pm25_column(fields)
+        if column is None:
+            logger.error("PurpleAir response has no PM2.5 column; fields=%s", fields)
+            return None
+
+        values = [
+            row[column]
+            for row in rows
+            if len(row) > column and row[column] is not None
+        ]
+        if not values:
+            logger.warning("PurpleAir returned %d sensors with no PM2.5 data", len(rows))
+            return None
+
+        return sum(values) / len(values)
+
     def _fetch_purpleair_data(self) -> Optional[Dict]:
         """Fetch air quality from PurpleAir."""
         api_key = self.config.get("purpleair_api_key")
         if not api_key:
             return None
-        
+
         sensor_id = self.config.get("purpleair_sensor_id")
+        read_key = self.config.get("purpleair_read_key")
         lat = self.config.get("latitude", 37.7749)
         lon = self.config.get("longitude", -122.4194)
-        
+        headers = {"X-API-Key": api_key}
+
         try:
             if sensor_id:
-                url = f"https://api.purpleair.com/v1/sensors/{sensor_id}"
-                params = {"fields": "pm2.5_10minute,humidity,temperature"}
+                pm25 = self._fetch_single_sensor_pm25(sensor_id, read_key, headers)
             else:
-                url = "https://api.purpleair.com/v1/sensors"
-                params = {
-                    "fields": "pm2.5_10minute,humidity,temperature",
-                    "location_type": "0",
-                    "max_age": 3600,
-                    "nwlat": lat + 0.05,
-                    "nwlng": lon - 0.05,
-                    "selat": lat - 0.05,
-                    "selng": lon + 0.05,
-                }
-            
-            headers = {"X-API-Key": api_key}
-            response = requests.get(url, params=params, headers=headers, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            if sensor_id:
-                sensor_data = data.get("sensor", {})
-                pm25 = sensor_data.get("pm2.5_10minute", 0)
-            else:
-                sensors = data.get("data", [])
-                if not sensors:
-                    return None
-                pm25_values = [s[0] for s in sensors if s[0] is not None]
-                pm25 = sum(pm25_values) / len(pm25_values) if pm25_values else 0
-            
-            aqi, category, color = self.calculate_aqi_from_pm25(pm25)
-            
-            return {
-                "pm2_5": round(pm25, 1),
-                "aqi": aqi,
-                "aqi_category": category,
-                "aqi_color": color,
-            }
-            
+                pm25 = self._fetch_nearby_sensors_pm25(lat, lon, read_key, headers)
+        except requests.HTTPError as e:
+            response = e.response
+            status = response.status_code if response is not None else "unknown"
+            body = response.text[:200] if response is not None else ""
+            logger.error("PurpleAir request failed with HTTP %s: %s", status, body)
+            return None
         except Exception as e:
             logger.error(f"Failed to fetch PurpleAir data: {e}")
             return None
+
+        if pm25 is None:
+            return None
+
+        if pm25 > MAX_PLAUSIBLE_PM25:
+            logger.error(
+                "Discarding implausible PurpleAir PM2.5 reading of %s; "
+                "the response shape has likely changed",
+                pm25,
+            )
+            return None
+
+        aqi, category, color = self.calculate_aqi_from_pm25(pm25)
+
+        return {
+            "pm2_5": round(pm25, 1),
+            "aqi": aqi,
+            "aqi_category": category,
+            "aqi_color": color,
+        }
     
     def _fetch_openweathermap_data(self) -> Optional[Dict]:
         """Fetch visibility from OpenWeatherMap."""
@@ -346,7 +441,7 @@ class AirFogPlugin(PluginBase):
         
         # Build formatted message
         parts = []
-        if result["aqi"]:
+        if result["aqi"] is not None:
             parts.append(f"AQI:{result['aqi']}")
         if result["visibility"]:
             parts.append(f"VIS:{result['visibility']}")

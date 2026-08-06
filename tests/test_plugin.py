@@ -646,6 +646,26 @@ class TestAirFogPluginClass:
         aqi, _, _ = AirFogPlugin.calculate_aqi_from_pm25(-5.0)
         assert aqi == 0
 
+    @pytest.mark.parametrize("pm25,expected_aqi,expected_category", [
+        (12.05, 50, "GOOD"),
+        (35.45, 100, "MODERATE"),
+        (55.45, 150, "UNHEALTHY_SENSITIVE"),
+        (150.45, 200, "UNHEALTHY"),
+        (250.45, 300, "VERY_UNHEALTHY"),
+    ])
+    def test_calculate_aqi_between_breakpoints(self, pm25, expected_aqi, expected_category):
+        """Regression: values between breakpoints must not fall through to 500.
+
+        The breakpoint table has 0.1-wide gaps between bands. Since PM2.5 is
+        averaged across several sensors it lands on arbitrary floats, and any
+        value inside a gap used to match no band and return a hazardous 500.
+        EPA truncates to one decimal before the lookup, which closes the gaps.
+        """
+        from plugins.air_fog import AirFogPlugin
+        aqi, category, _ = AirFogPlugin.calculate_aqi_from_pm25(pm25)
+        assert aqi == expected_aqi
+        assert category == expected_category
+
     def test_determine_fog_status_foggy(self, plugin):
         is_foggy, status, color = plugin.determine_fog_status(1000, 70, 65)
         assert is_foggy is True
@@ -717,14 +737,21 @@ class TestAirFogPluginClass:
             assert not result.available
 
     def test_fetch_purpleair_data_with_sensor_id(self, plugin):
-        """Test _fetch_purpleair_data with specific sensor ID."""
+        """Test _fetch_purpleair_data with specific sensor ID.
+
+        GET /v1/sensors/:sensor_index exposes the running averages through the
+        stats object, not at the top level of the sensor object.
+        """
         plugin._config = {
             "purpleair_api_key": "test_key",
             "purpleair_sensor_id": "12345"
         }
         mock_resp = Mock()
         mock_resp.json.return_value = {
-            "sensor": {"pm2.5_10minute": 25.5}
+            "sensor": {
+                "sensor_index": 12345,
+                "stats": {"pm2.5": 24.0, "pm2.5_10minute": 25.5},
+            }
         }
         with patch('plugins.air_fog.requests.get', return_value=mock_resp):
             result = plugin._fetch_purpleair_data()
@@ -732,8 +759,36 @@ class TestAirFogPluginClass:
             assert result["pm2_5"] == 25.5
             assert "aqi" in result
 
+    def test_fetch_purpleair_data_sensor_id_top_level_fallback(self, plugin):
+        """Fall back to a top-level reading when no stats object is present."""
+        plugin._config = {
+            "purpleair_api_key": "test_key",
+            "purpleair_sensor_id": "12345"
+        }
+        mock_resp = Mock()
+        mock_resp.json.return_value = {"sensor": {"sensor_index": 12345, "pm2.5": 25.5}}
+        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
+            result = plugin._fetch_purpleair_data()
+            assert result is not None
+            assert result["pm2_5"] == 25.5
+
+    def test_fetch_purpleair_data_sensor_id_no_reading(self, plugin):
+        """A sensor that reports no PM2.5 value yields no data, not AQI 0."""
+        plugin._config = {
+            "purpleair_api_key": "test_key",
+            "purpleair_sensor_id": "12345"
+        }
+        mock_resp = Mock()
+        mock_resp.json.return_value = {"sensor": {"sensor_index": 12345}}
+        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
+            assert plugin._fetch_purpleair_data() is None
+
     def test_fetch_purpleair_data_no_sensor_id(self, plugin):
-        """Test _fetch_purpleair_data without sensor ID (nearby search)."""
+        """Test _fetch_purpleair_data without sensor ID (nearby search).
+
+        PurpleAir prepends sensor_index to the requested fields, so the PM2.5
+        values live in column 1 here, not column 0.
+        """
         plugin._config = {
             "purpleair_api_key": "test_key",
             "latitude": 37.7749,
@@ -741,12 +796,72 @@ class TestAirFogPluginClass:
         }
         mock_resp = Mock()
         mock_resp.json.return_value = {
-            "data": [[30.0], [35.0], [28.0]]
+            "fields": ["sensor_index", "pm2.5_10minute"],
+            "data": [[77245, 30.0], [95189, 35.0], [142936, 28.0]],
         }
         with patch('plugins.air_fog.requests.get', return_value=mock_resp):
             result = plugin._fetch_purpleair_data()
             assert result is not None
             assert result["pm2_5"] == 31.0  # Average of 30, 35, 28
+
+    def test_fetch_purpleair_data_resolves_column_by_name(self, plugin):
+        """Column position is read from the response's own fields array.
+
+        The API docs warn that column order may change as fields are added, so
+        a reordered response with extra columns must still parse correctly.
+        """
+        plugin._config = {
+            "purpleair_api_key": "test_key",
+            "latitude": 37.7749,
+            "longitude": -122.4194
+        }
+        mock_resp = Mock()
+        mock_resp.json.return_value = {
+            "fields": ["sensor_index", "name", "humidity", "pm2.5_10minute", "temperature"],
+            "data": [
+                [77245, "Mission", 48, 30.0, 71],
+                [95189, "Bernal", 51, 32.0, 69],
+            ],
+        }
+        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
+            result = plugin._fetch_purpleair_data()
+            assert result is not None
+            assert result["pm2_5"] == 31.0
+
+    def test_fetch_purpleair_data_missing_pm25_column(self, plugin):
+        """A response with no PM2.5 column yields no data rather than garbage."""
+        plugin._config = {
+            "purpleair_api_key": "test_key",
+            "latitude": 37.7749,
+            "longitude": -122.4194
+        }
+        mock_resp = Mock()
+        mock_resp.json.return_value = {
+            "fields": ["sensor_index", "humidity"],
+            "data": [[77245, 48]],
+        }
+        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
+            assert plugin._fetch_purpleair_data() is None
+
+    def test_fetch_purpleair_data_rejects_implausible_reading(self, plugin):
+        """Regression: sensor indexes parsed as PM2.5 must not become AQI 500.
+
+        Reading column 0 (sensor_index) as a PM2.5 concentration used to average
+        five-digit sensor IDs, overflow the top breakpoint, and report a
+        hazardous AQI of 500 to every user without a configured sensor ID.
+        """
+        plugin._config = {
+            "purpleair_api_key": "test_key",
+            "latitude": 37.7749,
+            "longitude": -122.4194
+        }
+        mock_resp = Mock()
+        mock_resp.json.return_value = {
+            "fields": ["pm2.5_10minute"],
+            "data": [[77245], [95189], [142936]],
+        }
+        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
+            assert plugin._fetch_purpleair_data() is None
 
     def test_fetch_purpleair_data_no_api_key(self, plugin):
         """Test _fetch_purpleair_data without API key."""
@@ -764,6 +879,38 @@ class TestAirFogPluginClass:
             result = plugin._fetch_purpleair_data()
             assert result is None
 
+    def test_fetch_purpleair_data_http_error(self, plugin):
+        """An HTTP error (e.g. a rejected API key) is handled and logged."""
+        import requests as _requests
+
+        plugin._config = {
+            "purpleair_api_key": "bad_key",
+            "purpleair_sensor_id": "12345"
+        }
+        error_resp = Mock()
+        error_resp.status_code = 403
+        error_resp.text = '{"error": "ApiKeyInvalidError"}'
+        with patch(
+            'plugins.air_fog.requests.get',
+            side_effect=_requests.HTTPError(response=error_resp),
+        ):
+            assert plugin._fetch_purpleair_data() is None
+
+    def test_fetch_purpleair_data_sends_read_key(self, plugin):
+        """A configured read key is forwarded for private sensors."""
+        plugin._config = {
+            "purpleair_api_key": "test_key",
+            "purpleair_sensor_id": "12345",
+            "purpleair_read_key": "sensor_read_key",
+        }
+        mock_resp = Mock()
+        mock_resp.json.return_value = {
+            "sensor": {"sensor_index": 12345, "stats": {"pm2.5_10minute": 10.0}}
+        }
+        with patch('plugins.air_fog.requests.get', return_value=mock_resp) as mock_get:
+            plugin._fetch_purpleair_data()
+            assert mock_get.call_args.kwargs["params"]["read_key"] == "sensor_read_key"
+
     def test_fetch_purpleair_data_no_nearby_sensors(self, plugin):
         """Test _fetch_purpleair_data with no nearby sensors."""
         plugin._config = {
@@ -776,6 +923,21 @@ class TestAirFogPluginClass:
         with patch('plugins.air_fog.requests.get', return_value=mock_resp):
             result = plugin._fetch_purpleair_data()
             assert result is None
+
+    def test_fetch_purpleair_data_all_null_readings(self, plugin):
+        """Sensors reporting null PM2.5 yield no data."""
+        plugin._config = {
+            "purpleair_api_key": "test_key",
+            "latitude": 37.7749,
+            "longitude": -122.4194
+        }
+        mock_resp = Mock()
+        mock_resp.json.return_value = {
+            "fields": ["sensor_index", "pm2.5_10minute"],
+            "data": [[77245, None], [95189, None]],
+        }
+        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
+            assert plugin._fetch_purpleair_data() is None
 
     def test_fetch_openweathermap_data_success(self, plugin):
         """Test _fetch_openweathermap_data with successful response."""

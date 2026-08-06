@@ -76,6 +76,7 @@ AIR_FOG_ENABLED=true
 # PurpleAir settings (optional)
 PURPLEAIR_API_KEY=your_purpleair_api_key_here
 PURPLEAIR_SENSOR_ID=  # Optional: specific sensor ID
+PURPLEAIR_READ_KEY=  # Optional: only for private sensors
 
 # OpenWeatherMap settings (optional)
 OPENWEATHERMAP_API_KEY=your_openweathermap_api_key_here
@@ -119,6 +120,13 @@ PURPLEAIR_SENSOR_ID=12345
 ```
 
 Without a sensor ID, FiestaBoard averages nearby outdoor sensors within ~5km.
+
+If the sensor is privately registered, it also needs its own read key. This is
+separate from your API key, and each sensor has a different one:
+
+```bash
+PURPLEAIR_READ_KEY=your_sensor_read_key
+```
 
 ### 5. Create a Page to Display Air Quality/Fog Data
 

@@ -81,6 +81,7 @@ For detailed setup instructions including API key registration, see the **[Setup
 | purpleair_api_key | string | - | PurpleAir API key |
 | openweathermap_api_key | string | - | OpenWeatherMap API key |
 | purpleair_sensor_id | string | - | Optional specific sensor ID |
+| purpleair_read_key | string | - | Optional per-sensor read key, required only for private sensors |
 | latitude | number | 40.7128 | Location latitude |
 | longitude | number | -74.0060 | Location longitude |
 | refresh_seconds | integer | 300 | Update interval |

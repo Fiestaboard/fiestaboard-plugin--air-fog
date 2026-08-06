@@ -1,7 +1,7 @@
 {
   "id": "air_fog",
   "name": "Air Quality & Fog",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "description": "Display air quality (AQI), fog/visibility conditions, and pollen/allergen levels",
   "author": "FiestaBoard Team",
   "repository": "https://github.com/Fiestaboard/fiestaboard-plugin--air-fog",
@@ -33,6 +33,12 @@
         "type": "string",
         "title": "PurpleAir Sensor ID",
         "description": "Optional: Specific sensor ID (otherwise uses nearby sensors)"
+      },
+      "purpleair_read_key": {
+        "type": "string",
+        "title": "PurpleAir Read Key",
+        "description": "Optional: Required only for privately registered sensors. Each sensor has its own read key, separate from the API key.",
+        "ui:widget": "password"
       },
       "latitude": {
         "type": "number",
@@ -69,6 +75,11 @@
       "name": "PURPLEAIR_SENSOR_ID",
       "required": false,
       "description": "Optional specific PurpleAir sensor ID"
+    },
+    {
+      "name": "PURPLEAIR_READ_KEY",
+      "required": false,
+      "description": "Optional per-sensor read key, required only for private sensors"
     },
     {
       "name": "AIR_FOG_LATITUDE",

@@ -300,9 +300,9 @@
     {
       "device_type": "note",
       "rows": [
-        "AIR QUALITY",
-        "AQI {66} 45",
-        "FOG Clear"
+        "{66}{66}{66}{66}{66}{66}{66}{66}{66}{66}{66}{66}{66}{66}{66}",
+        "  AQI 45 GOOD",
+        "  FOG CLEAR"
       ]
     }
   ],

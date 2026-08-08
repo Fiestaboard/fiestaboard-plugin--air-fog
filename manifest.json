@@ -284,6 +284,28 @@
       "primary": true
     }
   ],
+  "teaser": "AQI {66}45 CLEAR",
+  "previews": [
+    {
+      "device_type": "flagship",
+      "rows": [
+        "{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}",
+        "     AIR QUALITY",
+        "     AQI 42  GOOD",
+        "{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}{67}",
+        "      VISIBILITY",
+        "  8.5 MILES  LIGHT FOG"
+      ]
+    },
+    {
+      "device_type": "note",
+      "rows": [
+        "AIR QUALITY",
+        "AQI {66} 45",
+        "FOG Clear"
+      ]
+    }
+  ],
   "demo": {
     "flagship": {
       "name": "Air Quality & Fog Demo",

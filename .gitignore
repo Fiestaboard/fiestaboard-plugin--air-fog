@@ -25,3 +25,8 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Created by CI (and by anyone reproducing it locally) so the plugin can be
+# imported as `plugins.air_fog`; see .github/workflows/ci.yml
+/plugins/
+/air_fog

@@ -1,711 +1,330 @@
-"""Tests for air quality and fog data source."""
+"""Tests for the air_fog plugin.
+
+Everything here exercises ``plugins.air_fog`` — the code this repo ships.
+The platform's ``src/utils/air_fog.py`` was a pre-extraction leftover and is
+gone; nothing below imports from ``src.utils``.
+"""
 
 import json
-import pytest
 from pathlib import Path
 from unittest.mock import Mock, patch
-from src.utils.air_fog import (
-    AirFogSource,
-    get_air_fog_source,
-    DEFAULT_LAT,
-    DEFAULT_LON,
+
+import pytest
+import requests as _requests
+
+from plugins.air_fog import (
+    OPEN_METEO_AIR_QUALITY_URL,
+    PURPLEAIR_SENSORS_URL,
+    AirFogPlugin,
+    Plugin,
 )
+
+MANIFEST_PATH = Path(__file__).resolve().parent.parent / "manifest.json"
+
+# The plugin falls back to these when no location is configured.
+SF_LAT = 37.7749
+SF_LON = -122.4194
+
+
+def _manifest():
+    with open(MANIFEST_PATH) as f:
+        return json.load(f)
+
+
+def _response(payload):
+    resp = Mock()
+    resp.status_code = 200
+    resp.json.return_value = payload
+    return resp
+
+
+def _purpleair_sensor(pm25):
+    return {"sensor": {"sensor_index": 12345, "stats": {"pm2.5_10minute": pm25}}}
+
+
+def _owm(visibility_m, humidity, temp_f):
+    return {"visibility": visibility_m, "main": {"humidity": humidity, "temp": temp_f}}
+
+
+def _pollen(grass=0, birch=0, alder=0, ragweed=0, mugwort=0, olive=0):
+    return {
+        "current": {
+            "grass_pollen": grass,
+            "birch_pollen": birch,
+            "alder_pollen": alder,
+            "ragweed_pollen": ragweed,
+            "mugwort_pollen": mugwort,
+            "olive_pollen": olive,
+        }
+    }
+
+
+def _route_by_url(purpleair=None, owm=None, pollen=None):
+    """A ``requests.get`` side effect that answers each upstream by URL."""
+
+    def side_effect(url, **kwargs):
+        if "purpleair" in url:
+            if purpleair is None:
+                raise Exception("no PurpleAir response scripted")
+            return _response(purpleair)
+        if "openweathermap" in url:
+            if owm is None:
+                raise Exception("no OpenWeatherMap response scripted")
+            return _response(owm)
+        if "open-meteo" in url:
+            if pollen is None:
+                raise Exception("no Open-Meteo response scripted")
+            return _response(pollen)
+        raise AssertionError(f"unexpected URL requested: {url}")
+
+    return side_effect
+
+
+@pytest.fixture
+def plugin():
+    return AirFogPlugin(_manifest())
+
+
+class TestPluginConstruction:
+    """What the platform does with this package: import ``Plugin`` and build it."""
+
+    def test_module_exports_the_plugin_class(self):
+        assert Plugin is AirFogPlugin
+
+    def test_plugin_id_matches_manifest(self, plugin):
+        assert plugin.plugin_id == _manifest()["id"] == "air_fog"
+
+    def test_validate_config_accepts_purpleair_key_alone(self, plugin):
+        assert plugin.validate_config({"purpleair_api_key": "k"}) == []
+
+    def test_validate_config_accepts_openweathermap_key_alone(self, plugin):
+        assert plugin.validate_config({"openweathermap_api_key": "k"}) == []
+
+    def test_validate_config_rejects_no_keys(self, plugin):
+        errors = plugin.validate_config({})
+        assert len(errors) == 1
+        assert "API key" in errors[0]
 
 
 class TestDewPointCalculation:
-    """Tests for dew point calculation - the core fog prediction logic."""
-    
-    def test_dew_point_at_100_percent_humidity(self):
-        """At 100% humidity, dew point equals temperature."""
-        temp_f = 68.0
-        humidity = 100.0
-        dew_point = AirFogSource.calculate_dew_point(temp_f, humidity)
-        # At 100% humidity, dew point should equal temperature
-        assert abs(dew_point - temp_f) < 0.5
-    
+    """Dew point via the Magnus formula — the core fog-prediction input."""
+
+    def test_dew_point_at_100_percent_humidity_equals_temperature(self):
+        assert abs(AirFogPlugin.calculate_dew_point(68.0, 100.0) - 68.0) < 0.5
+
     def test_dew_point_at_50_percent_humidity(self):
-        """At 50% humidity, dew point is significantly below temperature."""
-        temp_f = 70.0
-        humidity = 50.0
-        dew_point = AirFogSource.calculate_dew_point(temp_f, humidity)
-        # Dew point should be lower than temperature
-        assert dew_point < temp_f
-        # At 70°F and 50% humidity, dew point is approximately 50°F
+        dew_point = AirFogPlugin.calculate_dew_point(70.0, 50.0)
+        assert dew_point < 70.0
         assert 48 < dew_point < 52
-    
+
     def test_dew_point_at_low_humidity(self):
-        """At low humidity, dew point is much lower than temperature."""
-        temp_f = 80.0
-        humidity = 20.0
-        dew_point = AirFogSource.calculate_dew_point(temp_f, humidity)
-        # At 20% humidity, dew point should be very low
-        assert dew_point < 40
-    
+        assert AirFogPlugin.calculate_dew_point(80.0, 20.0) < 40
+
     def test_dew_point_cold_conditions(self):
-        """Test dew point calculation in cold conditions."""
-        temp_f = 32.0  # Freezing
-        humidity = 80.0
-        dew_point = AirFogSource.calculate_dew_point(temp_f, humidity)
-        # Dew point should be below temperature
-        assert dew_point < temp_f
-        assert dew_point > 20  # But not unreasonably low
-    
+        dew_point = AirFogPlugin.calculate_dew_point(32.0, 80.0)
+        assert 20 < dew_point < 32.0
+
     def test_dew_point_hot_conditions(self):
-        """Test dew point calculation in hot conditions."""
-        temp_f = 100.0
-        humidity = 70.0
-        dew_point = AirFogSource.calculate_dew_point(temp_f, humidity)
-        assert dew_point < temp_f
-        # High humidity at 100F should have dew point around 88F
+        dew_point = AirFogPlugin.calculate_dew_point(100.0, 70.0)
         assert 85 < dew_point < 92
-    
+
     def test_dew_point_fog_condition(self):
-        """When temp approaches dew point, fog can form."""
-        temp_f = 55.0
-        humidity = 95.0
-        dew_point = AirFogSource.calculate_dew_point(temp_f, humidity)
-        # At 95% humidity, dew point should be very close to temperature
-        assert temp_f - dew_point < 3
-    
+        assert 55.0 - AirFogPlugin.calculate_dew_point(55.0, 95.0) < 3
+
     def test_dew_point_returns_float(self):
-        """Dew point should return a rounded float."""
-        dew_point = AirFogSource.calculate_dew_point(70.0, 60.0)
-        assert isinstance(dew_point, float)
-    
-    def test_dew_point_typical_san_francisco(self):
-        """Test typical San Francisco marine layer conditions."""
-        # Cool, humid morning - typical fog conditions
-        temp_f = 58.0
-        humidity = 92.0
-        dew_point = AirFogSource.calculate_dew_point(temp_f, humidity)
-        # Dew point very close to temperature = fog likely
-        assert temp_f - dew_point < 5
+        assert isinstance(AirFogPlugin.calculate_dew_point(70.0, 60.0), float)
+
+    def test_dew_point_typical_marine_layer(self):
+        assert 58.0 - AirFogPlugin.calculate_dew_point(58.0, 92.0) < 5
+
+    def test_dew_point_extreme_cold(self):
+        assert AirFogPlugin.calculate_dew_point(-10.0, 60.0) < -10.0
+
+    def test_dew_point_extreme_heat(self):
+        assert AirFogPlugin.calculate_dew_point(115.0, 30.0) < 80
+
+    def test_dew_point_near_100_humidity(self):
+        assert abs(AirFogPlugin.calculate_dew_point(72.0, 99.0) - 72.0) < 1.0
+
+    def test_dew_point_very_low_humidity(self):
+        assert AirFogPlugin.calculate_dew_point(70.0, 10.0) < 20
 
 
 class TestAQICalculation:
-    """Tests for AQI calculation from PM2.5 values."""
-    
-    def test_good_air_quality(self):
-        """Test GOOD AQI (0-50) for low PM2.5."""
-        aqi, category, color = AirFogSource.calculate_aqi_from_pm25(5.0)
-        assert aqi < 50
-        assert category == "GOOD"
-        assert color == "GREEN"
-    
-    def test_moderate_air_quality(self):
-        """Test MODERATE AQI (51-100) for moderate PM2.5."""
-        aqi, category, color = AirFogSource.calculate_aqi_from_pm25(20.0)
-        assert 51 <= aqi <= 100
-        assert category == "MODERATE"
-        assert color == "YELLOW"
-    
-    def test_unhealthy_sensitive_air_quality(self):
-        """Test UNHEALTHY_SENSITIVE AQI (101-150)."""
-        aqi, category, color = AirFogSource.calculate_aqi_from_pm25(40.0)
-        assert 101 <= aqi <= 150
-        assert category == "UNHEALTHY_SENSITIVE"
-        assert color == "ORANGE"
-    
-    def test_unhealthy_air_quality(self):
-        """Test UNHEALTHY AQI (151-200)."""
-        aqi, category, color = AirFogSource.calculate_aqi_from_pm25(100.0)
-        assert 151 <= aqi <= 200
-        assert category == "UNHEALTHY"
-        assert color == "RED"
-    
-    def test_very_unhealthy_air_quality(self):
-        """Test VERY_UNHEALTHY AQI (201-300)."""
-        aqi, category, color = AirFogSource.calculate_aqi_from_pm25(200.0)
-        assert 201 <= aqi <= 300
-        assert category == "VERY_UNHEALTHY"
-        assert color == "PURPLE"
-    
-    def test_hazardous_air_quality(self):
-        """Test HAZARDOUS AQI (301-500)."""
-        aqi, category, color = AirFogSource.calculate_aqi_from_pm25(300.0)
-        assert 301 <= aqi <= 500
-        assert category == "HAZARDOUS"
-        assert color == "MAROON"
-    
-    def test_extreme_pm25_values(self):
-        """Test handling of extreme PM2.5 values."""
-        aqi, category, color = AirFogSource.calculate_aqi_from_pm25(600.0)
-        assert aqi == 500
-        assert category == "HAZARDOUS"
-        assert color == "MAROON"
-    
+    """AQI from PM2.5 using the US EPA breakpoint table."""
+
+    @pytest.mark.parametrize(
+        "pm25,lo,hi,category,color",
+        [
+            (5.0, 0, 50, "GOOD", "GREEN"),
+            (20.0, 51, 100, "MODERATE", "YELLOW"),
+            (40.0, 101, 150, "UNHEALTHY_SENSITIVE", "ORANGE"),
+            (100.0, 151, 200, "UNHEALTHY", "RED"),
+            (200.0, 201, 300, "VERY_UNHEALTHY", "PURPLE"),
+            (300.0, 301, 500, "HAZARDOUS", "MAROON"),
+        ],
+    )
+    def test_each_band(self, pm25, lo, hi, category, color):
+        aqi, got_category, got_color = AirFogPlugin.calculate_aqi_from_pm25(pm25)
+        assert lo <= aqi <= hi
+        assert got_category == category
+        assert got_color == color
+
+    def test_extreme_pm25_caps_at_500(self):
+        assert AirFogPlugin.calculate_aqi_from_pm25(600.0) == (500, "HAZARDOUS", "MAROON")
+
     def test_zero_pm25(self):
-        """Test zero PM2.5 value."""
-        aqi, category, color = AirFogSource.calculate_aqi_from_pm25(0.0)
-        assert aqi == 0
-        assert category == "GOOD"
-        assert color == "GREEN"
-    
-    def test_negative_pm25_handled(self):
-        """Test negative PM2.5 is treated as zero."""
-        aqi, category, color = AirFogSource.calculate_aqi_from_pm25(-5.0)
-        assert aqi == 0
-        assert category == "GOOD"
-        assert color == "GREEN"
-    
+        assert AirFogPlugin.calculate_aqi_from_pm25(0.0) == (0, "GOOD", "GREEN")
+
+    def test_negative_pm25_treated_as_zero(self):
+        assert AirFogPlugin.calculate_aqi_from_pm25(-5.0) == (0, "GOOD", "GREEN")
+
     def test_fire_trigger_threshold(self):
-        """Test the fire trigger at AQI > 100."""
-        # Just below threshold
-        aqi, _, _ = AirFogSource.calculate_aqi_from_pm25(35.0)
+        aqi, _, _ = AirFogPlugin.calculate_aqi_from_pm25(35.0)
         assert aqi <= 100
-        
-        # Just above threshold
-        aqi, _, _ = AirFogSource.calculate_aqi_from_pm25(36.0)
+        aqi, _, _ = AirFogPlugin.calculate_aqi_from_pm25(36.0)
         assert aqi > 100
-    
+
     def test_aqi_breakpoint_boundaries(self):
-        """Test AQI calculation at exact breakpoint boundaries."""
-        # At 12.0 PM2.5 (top of GOOD)
-        aqi, category, _ = AirFogSource.calculate_aqi_from_pm25(12.0)
-        assert aqi == 50
-        assert category == "GOOD"
-        
-        # At 12.1 PM2.5 (bottom of MODERATE)
-        aqi, category, _ = AirFogSource.calculate_aqi_from_pm25(12.1)
-        assert aqi == 51
-        assert category == "MODERATE"
+        assert AirFogPlugin.calculate_aqi_from_pm25(12.0)[:2] == (50, "GOOD")
+        assert AirFogPlugin.calculate_aqi_from_pm25(12.1)[:2] == (51, "MODERATE")
 
+    @pytest.mark.parametrize(
+        "pm25,expected_aqi,expected_category",
+        [
+            (12.05, 50, "GOOD"),
+            (35.45, 100, "MODERATE"),
+            (55.45, 150, "UNHEALTHY_SENSITIVE"),
+            (150.45, 200, "UNHEALTHY"),
+            (250.45, 300, "VERY_UNHEALTHY"),
+        ],
+    )
+    def test_values_between_breakpoints_do_not_fall_through(
+        self, pm25, expected_aqi, expected_category
+    ):
+        """Regression: values in the 0.1-wide gaps between bands must not become 500.
 
-class TestFogStatus:
-    """Tests for fog status determination."""
-    
-    def test_heavy_fog_low_visibility(self):
-        """Test HEAVY FOG when visibility < 1600m."""
-        is_foggy, status, color = AirFogSource.determine_fog_status(
-            visibility_m=1000,
-            humidity=70,
-            temp_f=65
-        )
-        assert is_foggy is True
-        assert status == "FOG: HEAVY"
-        assert color == "ORANGE"
-    
-    def test_heavy_fog_at_visibility_threshold(self):
-        """Test fog trigger exactly at 1600m threshold."""
-        # Just below threshold
-        is_foggy, status, _ = AirFogSource.determine_fog_status(
-            visibility_m=1599,
-            humidity=70,
-            temp_f=65
-        )
-        assert is_foggy is True
-        assert status == "FOG: HEAVY"
-        
-        # At threshold - not foggy
-        is_foggy, status, _ = AirFogSource.determine_fog_status(
-            visibility_m=1600,
-            humidity=70,
-            temp_f=65
-        )
-        assert is_foggy is False
-    
-    def test_heavy_fog_humidity_and_temp_condition(self):
-        """Test HEAVY FOG when humidity > 95% AND temp < 60F."""
-        is_foggy, status, color = AirFogSource.determine_fog_status(
-            visibility_m=5000,  # Good visibility
-            humidity=96,
-            temp_f=55
-        )
-        assert is_foggy is True
-        assert status == "FOG: HEAVY"
-        assert color == "ORANGE"
-    
-    def test_no_fog_high_humidity_but_warm(self):
-        """Test no fog when humidity > 95% but temp >= 60F."""
-        is_foggy, status, _ = AirFogSource.determine_fog_status(
-            visibility_m=5000,
-            humidity=96,
-            temp_f=60  # At threshold - not cold enough
-        )
-        assert is_foggy is False
-    
-    def test_no_fog_cold_but_low_humidity(self):
-        """Test no fog when temp < 60F but humidity <= 95%."""
-        is_foggy, status, _ = AirFogSource.determine_fog_status(
-            visibility_m=5000,
-            humidity=95,  # At threshold - not humid enough
-            temp_f=55
-        )
-        assert is_foggy is False
-    
-    def test_light_fog_moderate_visibility(self):
-        """Test LIGHT FOG when visibility between 1600m and 3000m."""
-        is_foggy, status, color = AirFogSource.determine_fog_status(
-            visibility_m=2500,
-            humidity=70,
-            temp_f=65
-        )
-        assert is_foggy is False
-        assert status == "FOG: LIGHT"
-        assert color == "YELLOW"
-    
-    def test_clear_conditions(self):
-        """Test CLEAR when visibility >= 3000m and no humidity/temp trigger."""
-        is_foggy, status, color = AirFogSource.determine_fog_status(
-            visibility_m=10000,
-            humidity=50,
-            temp_f=70
-        )
-        assert is_foggy is False
-        assert status == "CLEAR"
-        assert color == "GREEN"
-    
-    def test_fog_priority_visibility_over_humidity_temp(self):
-        """Visibility-based fog should trigger even with dry conditions."""
-        is_foggy, status, _ = AirFogSource.determine_fog_status(
-            visibility_m=500,
-            humidity=30,  # Low humidity
-            temp_f=80  # Warm
-        )
-        assert is_foggy is True
-        assert status == "FOG: HEAVY"
-    
-    def test_typical_sf_fog_conditions(self):
-        """Test typical San Francisco summer fog conditions."""
-        # Morning marine layer
-        is_foggy, status, color = AirFogSource.determine_fog_status(
-            visibility_m=800,  # Very low visibility
-            humidity=98,
-            temp_f=54
-        )
-        assert is_foggy is True
-        assert status == "FOG: HEAVY"
-        assert color == "ORANGE"
-
-
-class TestAirStatus:
-    """Tests for air quality status determination."""
-    
-    def test_air_good(self):
-        """Test GOOD air status."""
-        status, color = AirFogSource.determine_air_status(aqi=40)
-        assert status == "AIR: GOOD"
-        assert color == "GREEN"
-    
-    def test_air_moderate(self):
-        """Test MODERATE air status."""
-        status, color = AirFogSource.determine_air_status(aqi=75)
-        assert status == "AIR: MODERATE"
-        assert color == "YELLOW"
-    
-    def test_air_unhealthy_orange(self):
-        """Test UNHEALTHY (orange) when AQI > 100 but <= 150."""
-        status, color = AirFogSource.determine_air_status(aqi=125)
-        assert status == "AIR: UNHEALTHY"
-        assert color == "ORANGE"
-    
-    def test_air_unhealthy_red(self):
-        """Test UNHEALTHY (red) when AQI > 150 but <= 200."""
-        status, color = AirFogSource.determine_air_status(aqi=175)
-        assert status == "AIR: UNHEALTHY"
-        assert color == "RED"
-    
-    def test_air_very_unhealthy(self):
-        """Test VERY UNHEALTHY when AQI > 200 but <= 300."""
-        status, color = AirFogSource.determine_air_status(aqi=250)
-        assert status == "AIR: VERY UNHEALTHY"
-        assert color == "PURPLE"
-    
-    def test_air_hazardous(self):
-        """Test HAZARDOUS when AQI > 300."""
-        status, color = AirFogSource.determine_air_status(aqi=350)
-        assert status == "AIR: HAZARDOUS"
-        assert color == "MAROON"
-    
-    def test_fire_trigger_at_boundary(self):
-        """Test fire trigger exactly at AQI = 100 boundary."""
-        # At 100 - still moderate
-        status, color = AirFogSource.determine_air_status(aqi=100)
-        assert status == "AIR: MODERATE"
-        assert color == "YELLOW"
-        
-        # At 101 - triggers unhealthy/orange
-        status, color = AirFogSource.determine_air_status(aqi=101)
-        assert status == "AIR: UNHEALTHY"
-        assert color == "ORANGE"
-
-
-class TestAirFogSource:
-    """Tests for AirFogSource class initialization and integration."""
-    
-    def test_init_default_location(self):
-        """Test AirFogSource initializes with default SF coordinates."""
-        source = AirFogSource()
-        assert source.latitude == DEFAULT_LAT
-        assert source.longitude == DEFAULT_LON
-    
-    def test_init_custom_location(self):
-        """Test AirFogSource with custom coordinates."""
-        source = AirFogSource(latitude=34.0, longitude=-118.0)
-        assert source.latitude == 34.0
-        assert source.longitude == -118.0
-    
-    def test_init_with_sensor_id(self):
-        """Test AirFogSource with specific PurpleAir sensor ID."""
-        source = AirFogSource(purpleair_sensor_id="12345")
-        assert source.purpleair_sensor_id == "12345"
-    
-    @patch('src.utils.air_fog.requests.get')
-    def test_fetch_openweathermap_success(self, mock_get):
-        """Test successful OpenWeatherMap data fetch."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "visibility": 5000,
-            "main": {
-                "humidity": 75,
-                "temp": 62.5
-            },
-            "weather": [{"main": "Clouds"}]
-        }
-        mock_get.return_value = mock_response
-        
-        source = AirFogSource(openweathermap_api_key="test_key")
-        result = source.fetch_openweathermap_data()
-        
-        assert result is not None
-        assert result["visibility_m"] == 5000
-        assert result["humidity"] == 75
-        assert result["temperature_f"] == 62.5
-        assert "dew_point_f" in result
-    
-    @patch('src.utils.air_fog.requests.get')
-    def test_fetch_openweathermap_api_error(self, mock_get):
-        """Test handling of OpenWeatherMap API errors."""
-        mock_get.side_effect = Exception("Network error")
-        
-        source = AirFogSource(openweathermap_api_key="test_key")
-        result = source.fetch_openweathermap_data()
-        
-        assert result is None
-    
-    @patch('src.utils.air_fog.requests.get')
-    def test_fetch_purpleair_success(self, mock_get):
-        """Test successful PurpleAir data fetch with sensor ID."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "sensor": {
-                "pm2.5_10minute": 25.5,
-                "humidity": 65,
-                "temperature": 70
-            }
-        }
-        mock_get.return_value = mock_response
-        
-        source = AirFogSource(
-            purpleair_api_key="test_key",
-            purpleair_sensor_id="12345"
-        )
-        result = source.fetch_purpleair_data()
-        
-        assert result is not None
-        assert result["pm2_5"] == 25.5
-        assert "aqi" in result
-        assert result["aqi_category"] == "MODERATE"
-    
-    @patch('src.utils.air_fog.requests.get')
-    def test_fetch_air_fog_combined(self, mock_get):
-        """Test combined air/fog data fetch."""
-        # Mock both API responses
-        def side_effect(url, **kwargs):
-            mock_response = Mock()
-            mock_response.status_code = 200
-            
-            if "purpleair" in url:
-                mock_response.json.return_value = {
-                    "sensor": {
-                        "pm2.5_10minute": 45.0,  # Unhealthy sensitive
-                        "humidity": 70,
-                        "temperature": 65
-                    }
-                }
-            else:  # OpenWeatherMap
-                mock_response.json.return_value = {
-                    "visibility": 1200,  # Foggy
-                    "main": {"humidity": 92, "temp": 55.0},
-                    "weather": [{"main": "Fog"}]
-                }
-            
-            return mock_response
-        
-        mock_get.side_effect = side_effect
-        
-        source = AirFogSource(
-            purpleair_api_key="purple_key",
-            openweathermap_api_key="owm_key",
-            purpleair_sensor_id="12345"
-        )
-        result = source.fetch_air_fog_data()
-        
-        assert result is not None
-        assert result["pm2_5_aqi"] is not None
-        assert result["visibility_m"] == 1200
-        assert result["is_foggy"] is True
-        assert result["fog_status"] == "FOG: HEAVY"
-        assert result["air_status"] == "AIR: UNHEALTHY"
-    
-    def test_format_message(self):
-        """Test message formatting for board."""
-        source = AirFogSource()
-        data = {
-            "pm2_5_aqi": 75,
-            "visibility_m": 8000,
-            "humidity": 65
-        }
-        message = source._format_message(data)
-        
-        assert "AQI:75" in message
-        assert "VIS:" in message
-        assert "HUM:65%" in message
-
-
-class TestDewPointEdgeCases:
-    """Additional edge case tests for dew point calculation."""
-    
-    def test_dew_point_extreme_cold(self):
-        """Test dew point in extreme cold conditions."""
-        # -10°F with 60% humidity
-        dew_point = AirFogSource.calculate_dew_point(-10.0, 60.0)
-        assert dew_point < -10.0  # Dew point should be lower than temp
-    
-    def test_dew_point_extreme_heat(self):
-        """Test dew point in extreme heat conditions."""
-        # 115°F with 30% humidity (desert)
-        dew_point = AirFogSource.calculate_dew_point(115.0, 30.0)
-        assert dew_point < 80  # Should be much lower due to low humidity
-    
-    def test_dew_point_near_100_humidity(self):
-        """Test dew point at near-100% humidity."""
-        dew_point = AirFogSource.calculate_dew_point(72.0, 99.0)
-        # Should be very close to temperature
-        assert abs(dew_point - 72.0) < 1.0
-    
-    def test_dew_point_very_low_humidity(self):
-        """Test dew point at very low humidity."""
-        dew_point = AirFogSource.calculate_dew_point(70.0, 10.0)
-        # Should be extremely low
-        assert dew_point < 20
-
-
-class TestFogPrediction:
-    """Tests for fog prediction combining dew point and visibility."""
-    
-    def test_fog_when_temp_near_dew_point(self):
-        """Fog should be predicted when temperature approaches dew point."""
-        temp_f = 55.0
-        humidity = 96.0
-        
-        # Calculate dew point
-        dew_point = AirFogSource.calculate_dew_point(temp_f, humidity)
-        
-        # Dew point spread should be small
-        dew_point_spread = temp_f - dew_point
-        assert dew_point_spread < 3  # Less than 3°F = fog likely
-        
-        # Verify fog status triggers
-        is_foggy, status, _ = AirFogSource.determine_fog_status(
-            visibility_m=2000,  # Moderate visibility
-            humidity=humidity,
-            temp_f=temp_f
-        )
-        assert is_foggy is True  # Due to humidity/temp condition
-    
-    def test_no_fog_large_dew_point_spread(self):
-        """No fog when there's a large dew point spread."""
-        temp_f = 75.0
-        humidity = 40.0
-        
-        # Calculate dew point
-        dew_point = AirFogSource.calculate_dew_point(temp_f, humidity)
-        
-        # Large spread
-        dew_point_spread = temp_f - dew_point
-        assert dew_point_spread > 20  # Large spread = no fog
-        
-        # Verify clear status
-        is_foggy, status, _ = AirFogSource.determine_fog_status(
-            visibility_m=10000,
-            humidity=humidity,
-            temp_f=temp_f
-        )
-        assert is_foggy is False
-        assert status == "CLEAR"
-
-
-class TestGetAirFogSource:
-    """Tests for get_air_fog_source factory function."""
-    
-    @patch('src.utils.air_fog.Config')
-    def test_get_air_fog_source_with_keys(self, mock_config):
-        """Test factory returns source when API keys configured."""
-        mock_config.PURPLEAIR_API_KEY = "test_purple_key"
-        mock_config.OPENWEATHERMAP_API_KEY = "test_owm_key"
-        mock_config.AIR_FOG_LATITUDE = 37.7749
-        mock_config.AIR_FOG_LONGITUDE = -122.4194
-        mock_config.PURPLEAIR_SENSOR_ID = None
-        
-        # Need to mock hasattr checks
-        def mock_hasattr(obj, name):
-            return True
-        
-        with patch('builtins.hasattr', mock_hasattr):
-            source = get_air_fog_source()
-        
-        assert source is not None
-        assert isinstance(source, AirFogSource)
-    
-    @patch('src.utils.air_fog.Config')
-    def test_get_air_fog_source_no_keys(self, mock_config):
-        """Test factory returns None when no API keys configured."""
-        # Mock hasattr to return False (no config attributes)
-        def mock_hasattr(obj, name):
-            return False
-        
-        with patch('builtins.hasattr', mock_hasattr):
-            source = get_air_fog_source()
-        
-        assert source is None
-
-
-class TestAirFogPluginClass:
-    """Tests for AirFogPlugin class (plugins/air_fog/__init__.py)."""
-
-    @pytest.fixture
-    def plugin(self):
-        from plugins.air_fog import AirFogPlugin
-        manifest = {"id": "air_fog", "name": "Air & Fog", "version": "1.0.0"}
-        return AirFogPlugin(manifest)
-
-    def test_plugin_id(self, plugin):
-        assert plugin.plugin_id == "air_fog"
-
-    def test_validate_config_purpleair_key(self, plugin):
-        assert plugin.validate_config({"purpleair_api_key": "k"}) == []
-
-    def test_validate_config_owm_key(self, plugin):
-        assert plugin.validate_config({"openweathermap_api_key": "k"}) == []
-
-    def test_validate_config_no_keys(self, plugin):
-        errors = plugin.validate_config({})
-        assert len(errors) == 1
-
-    def test_calculate_dew_point_100_humidity(self):
-        from plugins.air_fog import AirFogPlugin
-        dp = AirFogPlugin.calculate_dew_point(68.0, 100.0)
-        assert abs(dp - 68.0) < 0.5
-
-    def test_calculate_dew_point_low_humidity(self):
-        from plugins.air_fog import AirFogPlugin
-        dp = AirFogPlugin.calculate_dew_point(70.0, 50.0)
-        assert dp < 70.0
-
-    def test_calculate_aqi_good(self):
-        from plugins.air_fog import AirFogPlugin
-        aqi, cat, color = AirFogPlugin.calculate_aqi_from_pm25(5.0)
-        assert cat == "GOOD"
-        assert color == "GREEN"
-
-    def test_calculate_aqi_moderate(self):
-        from plugins.air_fog import AirFogPlugin
-        aqi, cat, _ = AirFogPlugin.calculate_aqi_from_pm25(20.0)
-        assert cat == "MODERATE"
-
-    def test_calculate_aqi_unhealthy_sensitive(self):
-        from plugins.air_fog import AirFogPlugin
-        aqi, cat, _ = AirFogPlugin.calculate_aqi_from_pm25(40.0)
-        assert cat == "UNHEALTHY_SENSITIVE"
-
-    def test_calculate_aqi_unhealthy(self):
-        from plugins.air_fog import AirFogPlugin
-        aqi, cat, _ = AirFogPlugin.calculate_aqi_from_pm25(100.0)
-        assert cat == "UNHEALTHY"
-
-    def test_calculate_aqi_very_unhealthy(self):
-        from plugins.air_fog import AirFogPlugin
-        aqi, cat, _ = AirFogPlugin.calculate_aqi_from_pm25(200.0)
-        assert cat == "VERY_UNHEALTHY"
-
-    def test_calculate_aqi_hazardous(self):
-        from plugins.air_fog import AirFogPlugin
-        aqi, cat, _ = AirFogPlugin.calculate_aqi_from_pm25(300.0)
-        assert cat == "HAZARDOUS"
-
-    def test_calculate_aqi_extreme(self):
-        from plugins.air_fog import AirFogPlugin
-        aqi, cat, _ = AirFogPlugin.calculate_aqi_from_pm25(600.0)
-        assert aqi == 500
-
-    def test_calculate_aqi_negative(self):
-        from plugins.air_fog import AirFogPlugin
-        aqi, _, _ = AirFogPlugin.calculate_aqi_from_pm25(-5.0)
-        assert aqi == 0
-
-    @pytest.mark.parametrize("pm25,expected_aqi,expected_category", [
-        (12.05, 50, "GOOD"),
-        (35.45, 100, "MODERATE"),
-        (55.45, 150, "UNHEALTHY_SENSITIVE"),
-        (150.45, 200, "UNHEALTHY"),
-        (250.45, 300, "VERY_UNHEALTHY"),
-    ])
-    def test_calculate_aqi_between_breakpoints(self, pm25, expected_aqi, expected_category):
-        """Regression: values between breakpoints must not fall through to 500.
-
-        The breakpoint table has 0.1-wide gaps between bands. Since PM2.5 is
-        averaged across several sensors it lands on arbitrary floats, and any
-        value inside a gap used to match no band and return a hazardous 500.
-        EPA truncates to one decimal before the lookup, which closes the gaps.
+        PM2.5 is averaged across several sensors so it lands on arbitrary
+        floats. EPA truncates to one decimal before the lookup, which closes
+        the gaps.
         """
-        from plugins.air_fog import AirFogPlugin
         aqi, category, _ = AirFogPlugin.calculate_aqi_from_pm25(pm25)
         assert aqi == expected_aqi
         assert category == expected_category
 
-    def test_determine_fog_status_foggy(self, plugin):
-        is_foggy, status, color = plugin.determine_fog_status(1000, 70, 65)
-        assert is_foggy is True
-        assert status == "FOG"
-        assert color == "ORANGE"
 
-    def test_determine_fog_status_humidity_temp(self, plugin):
-        is_foggy, status, _ = plugin.determine_fog_status(5000, 96, 55)
-        assert is_foggy is True
+class TestFogStatus:
+    """``determine_fog_status`` returns (is_foggy, status, colour)."""
 
-    def test_determine_fog_status_haze(self, plugin):
-        is_foggy, status, color = plugin.determine_fog_status(2500, 70, 65)
-        assert is_foggy is False
-        assert status == "HAZE"
-        assert color == "YELLOW"
+    def test_fog_when_visibility_below_1600m(self, plugin):
+        assert plugin.determine_fog_status(1000, 70, 65) == (True, "FOG", "ORANGE")
 
-    def test_determine_fog_status_clear(self, plugin):
-        is_foggy, status, color = plugin.determine_fog_status(10000, 50, 70)
-        assert is_foggy is False
-        assert status == "CLEAR"
-        assert color == "GREEN"
+    def test_visibility_threshold_is_exclusive(self, plugin):
+        assert plugin.determine_fog_status(1599, 70, 65)[0] is True
+        assert plugin.determine_fog_status(1600, 70, 65)[0] is False
 
-    def test_determine_air_status_good(self, plugin):
-        assert plugin.determine_air_status(40) == ("GOOD", "GREEN")
+    def test_fog_when_humid_and_cold(self, plugin):
+        assert plugin.determine_fog_status(5000, 96, 55) == (True, "FOG", "ORANGE")
 
-    def test_determine_air_status_moderate(self, plugin):
-        assert plugin.determine_air_status(75) == ("MODERATE", "YELLOW")
+    def test_no_fog_when_humid_but_not_cold(self, plugin):
+        assert plugin.determine_fog_status(5000, 96, 60)[0] is False
 
-    def test_determine_air_status_moderate_high(self, plugin):
-        assert plugin.determine_air_status(125) == ("MODERATE HIGH", "ORANGE")
+    def test_no_fog_when_cold_but_not_humid_enough(self, plugin):
+        assert plugin.determine_fog_status(5000, 95, 55)[0] is False
 
-    def test_determine_air_status_unhealthy(self, plugin):
-        assert plugin.determine_air_status(175) == ("UNHEALTHY", "RED")
+    def test_haze_between_1600m_and_3000m(self, plugin):
+        assert plugin.determine_fog_status(2500, 70, 65) == (False, "HAZE", "YELLOW")
 
-    def test_determine_air_status_very_unhealthy(self, plugin):
-        assert plugin.determine_air_status(250) == ("VERY UNHEALTHY", "PURPLE")
+    def test_clear_at_3000m_and_above(self, plugin):
+        assert plugin.determine_fog_status(10000, 50, 70) == (False, "CLEAR", "GREEN")
 
-    def test_determine_air_status_hazardous(self, plugin):
-        assert plugin.determine_air_status(350) == ("HAZARDOUS", "MAROON")
+    def test_visibility_wins_over_dry_warm_air(self, plugin):
+        assert plugin.determine_fog_status(500, 30, 80) == (True, "FOG", "ORANGE")
 
+
+class TestAirStatus:
+    """``determine_air_status`` maps an AQI to a status word and colour."""
+
+    @pytest.mark.parametrize(
+        "aqi,expected",
+        [
+            (40, ("GOOD", "GREEN")),
+            (75, ("MODERATE", "YELLOW")),
+            (125, ("MODERATE HIGH", "ORANGE")),
+            (175, ("UNHEALTHY", "RED")),
+            (250, ("VERY UNHEALTHY", "PURPLE")),
+            (350, ("HAZARDOUS", "MAROON")),
+        ],
+    )
+    def test_each_band(self, plugin, aqi, expected):
+        assert plugin.determine_air_status(aqi) == expected
+
+    def test_fire_trigger_at_aqi_100_boundary(self, plugin):
+        assert plugin.determine_air_status(100) == ("MODERATE", "YELLOW")
+        assert plugin.determine_air_status(101) == ("MODERATE HIGH", "ORANGE")
+
+
+class TestPollenLevel:
+    """``determine_pollen_level`` against each species' threshold table."""
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (10, ("LOW", "GREEN")),
+            (50, ("MODERATE", "YELLOW")),
+            (100, ("HIGH", "ORANGE")),
+            (300, ("VERY HIGH", "RED")),
+            (0, ("LOW", "GREEN")),
+            (-5, ("LOW", "GREEN")),
+        ],
+    )
+    def test_grass_bands(self, value, expected):
+        assert (
+            AirFogPlugin.determine_pollen_level(value, AirFogPlugin.GRASS_POLLEN_THRESHOLDS)
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (30, ("LOW", "GREEN")),
+            (100, ("MODERATE", "YELLOW")),
+            (500, ("HIGH", "ORANGE")),
+            (800, ("VERY HIGH", "RED")),
+        ],
+    )
+    def test_tree_bands(self, value, expected):
+        assert (
+            AirFogPlugin.determine_pollen_level(value, AirFogPlugin.TREE_POLLEN_THRESHOLDS)
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (5, ("LOW", "GREEN")),
+            (50, ("MODERATE", "YELLOW")),
+            (200, ("HIGH", "ORANGE")),
+        ],
+    )
+    def test_weed_bands(self, value, expected):
+        assert (
+            AirFogPlugin.determine_pollen_level(value, AirFogPlugin.WEED_POLLEN_THRESHOLDS)
+            == expected
+        )
+
+    def test_grass_low_moderate_boundary(self):
+        table = AirFogPlugin.GRASS_POLLEN_THRESHOLDS
+        assert AirFogPlugin.determine_pollen_level(20, table)[0] == "LOW"
+        assert AirFogPlugin.determine_pollen_level(21, table)[0] == "MODERATE"
+
+    def test_grass_moderate_high_boundary(self):
+        table = AirFogPlugin.GRASS_POLLEN_THRESHOLDS
+        assert AirFogPlugin.determine_pollen_level(77, table)[0] == "MODERATE"
+        assert AirFogPlugin.determine_pollen_level(78, table)[0] == "HIGH"
+
+
+class TestColorCodes:
     def test_color_to_code(self, plugin):
         assert plugin._color_to_code("GREEN") == 66
         assert plugin._color_to_code("YELLOW") == 65
@@ -713,756 +332,334 @@ class TestAirFogPluginClass:
         assert plugin._color_to_code("RED") == 63
         assert plugin._color_to_code("PURPLE") == 68
         assert plugin._color_to_code("MAROON") == 68
+
+    def test_unknown_color_falls_back_to_green(self, plugin):
         assert plugin._color_to_code("UNKNOWN") == 66
 
-    def test_fetch_data_both_sources(self, plugin):
-        plugin._config = {
-            "purpleair_api_key": "test",
-            "openweathermap_api_key": "test",
-        }
-        pa_data = {"aqi": 75, "pm2_5": 20.0, "aqi_category": "MODERATE", "aqi_color": "YELLOW"}
-        owm_data = {"visibility_m": 5000, "humidity": 75, "temperature_f": 62.5}
-        with patch.object(plugin, '_fetch_purpleair_data', return_value=pa_data), \
-             patch.object(plugin, '_fetch_openweathermap_data', return_value=owm_data):
-            result = plugin.fetch_data()
-            assert result.available
-            assert result.data["aqi"] == 75
-            assert "VIS:" in result.data["formatted"]
 
-    def test_fetch_data_no_sources(self, plugin):
-        with patch.object(plugin, '_fetch_purpleair_data', return_value=None), \
-             patch.object(plugin, '_fetch_openweathermap_data', return_value=None), \
-             patch.object(plugin, '_fetch_pollen_data', return_value=None):
-            result = plugin.fetch_data()
-            assert not result.available
+class TestLocation:
+    """Where the plugin asks for data when a location is (not) configured."""
 
-    def test_fetch_purpleair_data_with_sensor_id(self, plugin):
-        """Test _fetch_purpleair_data with specific sensor ID.
+    def test_default_location_is_san_francisco(self, plugin):
+        plugin.config = {"openweathermap_api_key": "k"}
+        with patch("plugins.air_fog.requests.get", return_value=_response(_owm(1, 1, 1))) as get:
+            plugin._fetch_openweathermap_data()
+        params = get.call_args.kwargs["params"]
+        assert (params["lat"], params["lon"]) == (SF_LAT, SF_LON)
 
-        GET /v1/sensors/:sensor_index exposes the running averages through the
-        stats object, not at the top level of the sensor object.
-        """
-        plugin._config = {
-            "purpleair_api_key": "test_key",
-            "purpleair_sensor_id": "12345"
+    def test_configured_location_is_sent_to_every_upstream(self, plugin):
+        plugin.config = {
+            "purpleair_api_key": "k",
+            "openweathermap_api_key": "k",
+            "latitude": 34.0,
+            "longitude": -118.0,
         }
-        mock_resp = Mock()
-        mock_resp.json.return_value = {
-            "sensor": {
-                "sensor_index": 12345,
-                "stats": {"pm2.5": 24.0, "pm2.5_10minute": 25.5},
-            }
-        }
-        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
+        side_effect = _route_by_url(
+            purpleair={"fields": ["sensor_index", "pm2.5_10minute"], "data": [[1, 10.0]]},
+            owm=_owm(10000, 50, 70),
+            pollen=_pollen(),
+        )
+        with patch("plugins.air_fog.requests.get", side_effect=side_effect) as get:
+            plugin.fetch_data()
+
+        by_url = {call.args[0]: call.kwargs["params"] for call in get.call_args_list}
+        assert by_url[PURPLEAIR_SENSORS_URL]["nwlat"] == pytest.approx(34.0 + 0.05)
+        assert by_url[PURPLEAIR_SENSORS_URL]["selng"] == pytest.approx(-118.0 + 0.05)
+        owm_url = next(u for u in by_url if "openweathermap" in u)
+        assert (by_url[owm_url]["lat"], by_url[owm_url]["lon"]) == (34.0, -118.0)
+        assert by_url[OPEN_METEO_AIR_QUALITY_URL]["latitude"] == 34.0
+        assert by_url[OPEN_METEO_AIR_QUALITY_URL]["longitude"] == -118.0
+
+
+class TestPurpleAir:
+    """``_fetch_purpleair_data``: single-sensor and nearby-sensor modes."""
+
+    def test_sensor_id_reads_from_stats_object(self, plugin):
+        """GET /v1/sensors/:id exposes running averages through ``stats``."""
+        plugin.config = {"purpleair_api_key": "test_key", "purpleair_sensor_id": "12345"}
+        payload = {"sensor": {"sensor_index": 12345, "stats": {"pm2.5": 24.0, "pm2.5_10minute": 25.5}}}
+        with patch("plugins.air_fog.requests.get", return_value=_response(payload)):
             result = plugin._fetch_purpleair_data()
-            assert result is not None
-            assert result["pm2_5"] == 25.5
-            assert "aqi" in result
+        assert result["pm2_5"] == 25.5
+        assert result["aqi_category"] == "MODERATE"
 
-    def test_fetch_purpleair_data_sensor_id_top_level_fallback(self, plugin):
-        """Fall back to a top-level reading when no stats object is present."""
-        plugin._config = {
-            "purpleair_api_key": "test_key",
-            "purpleair_sensor_id": "12345"
-        }
-        mock_resp = Mock()
-        mock_resp.json.return_value = {"sensor": {"sensor_index": 12345, "pm2.5": 25.5}}
-        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
-            result = plugin._fetch_purpleair_data()
-            assert result is not None
-            assert result["pm2_5"] == 25.5
+    def test_sensor_id_falls_back_to_top_level_reading(self, plugin):
+        plugin.config = {"purpleair_api_key": "test_key", "purpleair_sensor_id": "12345"}
+        payload = {"sensor": {"sensor_index": 12345, "pm2.5": 25.5}}
+        with patch("plugins.air_fog.requests.get", return_value=_response(payload)):
+            assert plugin._fetch_purpleair_data()["pm2_5"] == 25.5
 
-    def test_fetch_purpleair_data_sensor_id_no_reading(self, plugin):
-        """A sensor that reports no PM2.5 value yields no data, not AQI 0."""
-        plugin._config = {
-            "purpleair_api_key": "test_key",
-            "purpleair_sensor_id": "12345"
-        }
-        mock_resp = Mock()
-        mock_resp.json.return_value = {"sensor": {"sensor_index": 12345}}
-        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
+    def test_sensor_id_requests_the_sensor_endpoint(self, plugin):
+        plugin.config = {"purpleair_api_key": "test_key", "purpleair_sensor_id": "12345"}
+        with patch(
+            "plugins.air_fog.requests.get", return_value=_response(_purpleair_sensor(10.0))
+        ) as get:
+            plugin._fetch_purpleair_data()
+        assert get.call_args.args[0] == f"{PURPLEAIR_SENSORS_URL}/12345"
+        assert get.call_args.kwargs["headers"] == {"X-API-Key": "test_key"}
+
+    def test_sensor_with_no_reading_yields_no_data(self, plugin):
+        """No PM2.5 value must not become AQI 0."""
+        plugin.config = {"purpleair_api_key": "test_key", "purpleair_sensor_id": "12345"}
+        payload = {"sensor": {"sensor_index": 12345}}
+        with patch("plugins.air_fog.requests.get", return_value=_response(payload)):
             assert plugin._fetch_purpleair_data() is None
 
-    def test_fetch_purpleair_data_no_sensor_id(self, plugin):
-        """Test _fetch_purpleair_data without sensor ID (nearby search).
-
-        PurpleAir prepends sensor_index to the requested fields, so the PM2.5
-        values live in column 1 here, not column 0.
-        """
-        plugin._config = {
-            "purpleair_api_key": "test_key",
-            "latitude": 37.7749,
-            "longitude": -122.4194
-        }
-        mock_resp = Mock()
-        mock_resp.json.return_value = {
+    def test_nearby_sensors_are_averaged(self, plugin):
+        """PurpleAir prepends sensor_index, so PM2.5 is column 1 here."""
+        plugin.config = {"purpleair_api_key": "test_key"}
+        payload = {
             "fields": ["sensor_index", "pm2.5_10minute"],
             "data": [[77245, 30.0], [95189, 35.0], [142936, 28.0]],
         }
-        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
-            result = plugin._fetch_purpleair_data()
-            assert result is not None
-            assert result["pm2_5"] == 31.0  # Average of 30, 35, 28
+        with patch("plugins.air_fog.requests.get", return_value=_response(payload)):
+            assert plugin._fetch_purpleair_data()["pm2_5"] == 31.0
 
-    def test_fetch_purpleair_data_resolves_column_by_name(self, plugin):
-        """Column position is read from the response's own fields array.
-
-        The API docs warn that column order may change as fields are added, so
-        a reordered response with extra columns must still parse correctly.
-        """
-        plugin._config = {
-            "purpleair_api_key": "test_key",
-            "latitude": 37.7749,
-            "longitude": -122.4194
-        }
-        mock_resp = Mock()
-        mock_resp.json.return_value = {
+    def test_nearby_column_is_resolved_by_name(self, plugin):
+        """The API docs warn column order may change; parse by the fields array."""
+        plugin.config = {"purpleair_api_key": "test_key"}
+        payload = {
             "fields": ["sensor_index", "name", "humidity", "pm2.5_10minute", "temperature"],
-            "data": [
-                [77245, "Mission", 48, 30.0, 71],
-                [95189, "Bernal", 51, 32.0, 69],
-            ],
+            "data": [[77245, "A", 48, 30.0, 71], [95189, "B", 51, 32.0, 69]],
         }
-        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
-            result = plugin._fetch_purpleair_data()
-            assert result is not None
-            assert result["pm2_5"] == 31.0
+        with patch("plugins.air_fog.requests.get", return_value=_response(payload)):
+            assert plugin._fetch_purpleair_data()["pm2_5"] == 31.0
 
-    def test_fetch_purpleair_data_missing_pm25_column(self, plugin):
-        """A response with no PM2.5 column yields no data rather than garbage."""
-        plugin._config = {
-            "purpleair_api_key": "test_key",
-            "latitude": 37.7749,
-            "longitude": -122.4194
-        }
-        mock_resp = Mock()
-        mock_resp.json.return_value = {
-            "fields": ["sensor_index", "humidity"],
-            "data": [[77245, 48]],
-        }
-        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
+    def test_nearby_missing_pm25_column_yields_no_data(self, plugin):
+        plugin.config = {"purpleair_api_key": "test_key"}
+        payload = {"fields": ["sensor_index", "humidity"], "data": [[77245, 48]]}
+        with patch("plugins.air_fog.requests.get", return_value=_response(payload)):
             assert plugin._fetch_purpleair_data() is None
 
-    def test_fetch_purpleair_data_rejects_implausible_reading(self, plugin):
-        """Regression: sensor indexes parsed as PM2.5 must not become AQI 500.
-
-        Reading column 0 (sensor_index) as a PM2.5 concentration used to average
-        five-digit sensor IDs, overflow the top breakpoint, and report a
-        hazardous AQI of 500 to every user without a configured sensor ID.
-        """
-        plugin._config = {
-            "purpleair_api_key": "test_key",
-            "latitude": 37.7749,
-            "longitude": -122.4194
-        }
-        mock_resp = Mock()
-        mock_resp.json.return_value = {
-            "fields": ["pm2.5_10minute"],
-            "data": [[77245], [95189], [142936]],
-        }
-        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
+    def test_implausible_reading_is_rejected(self, plugin):
+        """Regression: sensor indexes parsed as PM2.5 must not become AQI 500."""
+        plugin.config = {"purpleair_api_key": "test_key"}
+        payload = {"fields": ["pm2.5_10minute"], "data": [[77245], [95189], [142936]]}
+        with patch("plugins.air_fog.requests.get", return_value=_response(payload)):
             assert plugin._fetch_purpleair_data() is None
 
-    def test_fetch_purpleair_data_no_api_key(self, plugin):
-        """Test _fetch_purpleair_data without API key."""
-        plugin._config = {}
-        result = plugin._fetch_purpleair_data()
-        assert result is None
+    def test_no_api_key_makes_no_request(self, plugin):
+        plugin.config = {}
+        with patch("plugins.air_fog.requests.get") as get:
+            assert plugin._fetch_purpleair_data() is None
+        get.assert_not_called()
 
-    def test_fetch_purpleair_data_api_error(self, plugin):
-        """Test _fetch_purpleair_data with API error."""
-        plugin._config = {
-            "purpleair_api_key": "test_key",
-            "purpleair_sensor_id": "12345"
-        }
-        with patch('plugins.air_fog.requests.get', side_effect=Exception("API error")):
-            result = plugin._fetch_purpleair_data()
-            assert result is None
+    def test_network_error_is_swallowed(self, plugin):
+        plugin.config = {"purpleair_api_key": "test_key", "purpleair_sensor_id": "12345"}
+        with patch("plugins.air_fog.requests.get", side_effect=Exception("API error")):
+            assert plugin._fetch_purpleair_data() is None
 
-    def test_fetch_purpleair_data_http_error(self, plugin):
-        """An HTTP error (e.g. a rejected API key) is handled and logged."""
-        import requests as _requests
-
-        plugin._config = {
-            "purpleair_api_key": "bad_key",
-            "purpleair_sensor_id": "12345"
-        }
+    def test_http_error_is_swallowed(self, plugin):
+        """A rejected API key (HTTP 403) is handled, not raised."""
+        plugin.config = {"purpleair_api_key": "bad_key", "purpleair_sensor_id": "12345"}
         error_resp = Mock()
         error_resp.status_code = 403
         error_resp.text = '{"error": "ApiKeyInvalidError"}'
         with patch(
-            'plugins.air_fog.requests.get',
+            "plugins.air_fog.requests.get",
             side_effect=_requests.HTTPError(response=error_resp),
         ):
             assert plugin._fetch_purpleair_data() is None
 
-    def test_fetch_purpleair_data_sends_read_key(self, plugin):
-        """A configured read key is forwarded for private sensors."""
-        plugin._config = {
+    def test_read_key_is_forwarded_for_private_sensors(self, plugin):
+        plugin.config = {
             "purpleair_api_key": "test_key",
             "purpleair_sensor_id": "12345",
             "purpleair_read_key": "sensor_read_key",
         }
-        mock_resp = Mock()
-        mock_resp.json.return_value = {
-            "sensor": {"sensor_index": 12345, "stats": {"pm2.5_10minute": 10.0}}
-        }
-        with patch('plugins.air_fog.requests.get', return_value=mock_resp) as mock_get:
+        with patch(
+            "plugins.air_fog.requests.get", return_value=_response(_purpleair_sensor(10.0))
+        ) as get:
             plugin._fetch_purpleair_data()
-            assert mock_get.call_args.kwargs["params"]["read_key"] == "sensor_read_key"
+        assert get.call_args.kwargs["params"]["read_key"] == "sensor_read_key"
 
-    def test_fetch_purpleair_data_no_nearby_sensors(self, plugin):
-        """Test _fetch_purpleair_data with no nearby sensors."""
-        plugin._config = {
-            "purpleair_api_key": "test_key",
-            "latitude": 37.7749,
-            "longitude": -122.4194
-        }
-        mock_resp = Mock()
-        mock_resp.json.return_value = {"data": []}
-        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
-            result = plugin._fetch_purpleair_data()
-            assert result is None
-
-    def test_fetch_purpleair_data_all_null_readings(self, plugin):
-        """Sensors reporting null PM2.5 yield no data."""
-        plugin._config = {
-            "purpleair_api_key": "test_key",
-            "latitude": 37.7749,
-            "longitude": -122.4194
-        }
-        mock_resp = Mock()
-        mock_resp.json.return_value = {
-            "fields": ["sensor_index", "pm2.5_10minute"],
-            "data": [[77245, None], [95189, None]],
-        }
-        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
+    def test_no_nearby_sensors_yields_no_data(self, plugin):
+        plugin.config = {"purpleair_api_key": "test_key"}
+        with patch("plugins.air_fog.requests.get", return_value=_response({"data": []})):
             assert plugin._fetch_purpleair_data() is None
 
-    def test_fetch_openweathermap_data_success(self, plugin):
-        """Test _fetch_openweathermap_data with successful response."""
-        plugin._config = {
-            "openweathermap_api_key": "test_key",
-            "latitude": 37.7749,
-            "longitude": -122.4194
-        }
-        mock_resp = Mock()
-        mock_resp.json.return_value = {
-            "visibility": 10000,
-            "main": {"humidity": 70, "temp": 293.15}
-        }
-        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
+    def test_all_null_nearby_readings_yield_no_data(self, plugin):
+        plugin.config = {"purpleair_api_key": "test_key"}
+        payload = {"fields": ["sensor_index", "pm2.5_10minute"], "data": [[1, None], [2, None]]}
+        with patch("plugins.air_fog.requests.get", return_value=_response(payload)):
+            assert plugin._fetch_purpleair_data() is None
+
+
+class TestOpenWeatherMap:
+    def test_success_returns_visibility_humidity_temperature(self, plugin):
+        plugin.config = {"openweathermap_api_key": "test_key"}
+        with patch("plugins.air_fog.requests.get", return_value=_response(_owm(5000, 75, 62.5))):
             result = plugin._fetch_openweathermap_data()
-            assert result is not None
-            assert result["visibility_m"] == 10000
-            assert result["humidity"] == 70
+        assert result == {"visibility_m": 5000, "humidity": 75, "temperature_f": 62.5}
 
-    def test_fetch_openweathermap_data_no_api_key(self, plugin):
-        """Test _fetch_openweathermap_data without API key."""
-        plugin._config = {}
-        result = plugin._fetch_openweathermap_data()
-        assert result is None
+    def test_request_asks_for_imperial_units(self, plugin):
+        plugin.config = {"openweathermap_api_key": "test_key"}
+        with patch("plugins.air_fog.requests.get", return_value=_response(_owm(1, 1, 1))) as get:
+            plugin._fetch_openweathermap_data()
+        params = get.call_args.kwargs["params"]
+        assert params["appid"] == "test_key"
+        assert params["units"] == "imperial"
 
-    def test_fetch_openweathermap_data_api_error(self, plugin):
-        """Test _fetch_openweathermap_data with API error."""
-        plugin._config = {
-            "openweathermap_api_key": "test_key",
-            "latitude": 37.7749,
-            "longitude": -122.4194
-        }
-        with patch('plugins.air_fog.requests.get', side_effect=Exception("API error")):
-            result = plugin._fetch_openweathermap_data()
-            assert result is None
+    def test_no_api_key_makes_no_request(self, plugin):
+        plugin.config = {}
+        with patch("plugins.air_fog.requests.get") as get:
+            assert plugin._fetch_openweathermap_data() is None
+        get.assert_not_called()
 
-    def test_determine_pollen_level_low(self):
-        from plugins.air_fog import AirFogPlugin
-        level, color = AirFogPlugin.determine_pollen_level(
-            10, AirFogPlugin.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "LOW"
-        assert color == "GREEN"
-
-    def test_determine_pollen_level_moderate(self):
-        from plugins.air_fog import AirFogPlugin
-        level, color = AirFogPlugin.determine_pollen_level(
-            50, AirFogPlugin.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "MODERATE"
-        assert color == "YELLOW"
-
-    def test_determine_pollen_level_high(self):
-        from plugins.air_fog import AirFogPlugin
-        level, color = AirFogPlugin.determine_pollen_level(
-            100, AirFogPlugin.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "HIGH"
-        assert color == "ORANGE"
-
-    def test_determine_pollen_level_very_high(self):
-        from plugins.air_fog import AirFogPlugin
-        level, color = AirFogPlugin.determine_pollen_level(
-            300, AirFogPlugin.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "VERY HIGH"
-        assert color == "RED"
-
-    def test_determine_pollen_level_negative(self):
-        from plugins.air_fog import AirFogPlugin
-        level, color = AirFogPlugin.determine_pollen_level(
-            -5, AirFogPlugin.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "LOW"
-        assert color == "GREEN"
-
-    def test_determine_pollen_level_zero(self):
-        from plugins.air_fog import AirFogPlugin
-        level, color = AirFogPlugin.determine_pollen_level(
-            0, AirFogPlugin.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "LOW"
-        assert color == "GREEN"
-
-    def test_determine_pollen_level_tree_thresholds(self):
-        from plugins.air_fog import AirFogPlugin
-        level, color = AirFogPlugin.determine_pollen_level(
-            100, AirFogPlugin.TREE_POLLEN_THRESHOLDS
-        )
-        assert level == "MODERATE"
-        assert color == "YELLOW"
-
-    def test_determine_pollen_level_weed_thresholds(self):
-        from plugins.air_fog import AirFogPlugin
-        level, color = AirFogPlugin.determine_pollen_level(
-            200, AirFogPlugin.WEED_POLLEN_THRESHOLDS
-        )
-        assert level == "HIGH"
-        assert color == "ORANGE"
-
-    def test_fetch_pollen_data_success(self, plugin):
-        """Test _fetch_pollen_data with successful response."""
-        plugin._config = {
-            "latitude": 37.7749,
-            "longitude": -122.4194
-        }
-        mock_resp = Mock()
-        mock_resp.json.return_value = {
-            "current": {
-                "grass_pollen": 10.0,
-                "birch_pollen": 30.0,
-                "alder_pollen": 20.0,
-                "ragweed_pollen": 5.0,
-                "mugwort_pollen": 3.0,
-                "olive_pollen": 15.0,
-            }
-        }
-        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
-            result = plugin._fetch_pollen_data()
-            assert result is not None
-            assert result["grass_pollen"] == 10.0
-            assert result["tree_pollen"] == 65.0  # 30 + 20 + 15
-            assert result["weed_pollen"] == 8.0    # 5 + 3
-            assert result["grass_pollen_level"] == "LOW"
-            assert result["tree_pollen_level"] == "MODERATE"
-            assert result["weed_pollen_level"] == "LOW"
-
-    def test_fetch_pollen_data_api_error(self, plugin):
-        """Test _fetch_pollen_data with API error."""
-        plugin._config = {
-            "latitude": 37.7749,
-            "longitude": -122.4194
-        }
-        with patch('plugins.air_fog.requests.get', side_effect=Exception("API error")):
-            result = plugin._fetch_pollen_data()
-            assert result is None
-
-    def test_fetch_pollen_data_null_values(self, plugin):
-        """Test _fetch_pollen_data with null pollen values."""
-        plugin._config = {
-            "latitude": 37.7749,
-            "longitude": -122.4194
-        }
-        mock_resp = Mock()
-        mock_resp.json.return_value = {
-            "current": {
-                "grass_pollen": None,
-                "birch_pollen": None,
-                "alder_pollen": None,
-                "ragweed_pollen": None,
-                "mugwort_pollen": None,
-                "olive_pollen": None,
-            }
-        }
-        with patch('plugins.air_fog.requests.get', return_value=mock_resp):
-            result = plugin._fetch_pollen_data()
-            assert result is not None
-            assert result["grass_pollen"] == 0
-            assert result["tree_pollen"] == 0
-            assert result["weed_pollen"] == 0
-
-    def test_fetch_data_with_pollen(self, plugin):
-        """Test fetch_data includes pollen data."""
-        plugin._config = {
-            "purpleair_api_key": "test",
-            "openweathermap_api_key": "test",
-        }
-        pa_data = {"aqi": 75, "pm2_5": 20.0, "aqi_category": "MODERATE", "aqi_color": "YELLOW"}
-        owm_data = {"visibility_m": 5000, "humidity": 75, "temperature_f": 62.5}
-        pollen_data = {
-            "grass_pollen": 10.0,
-            "grass_pollen_level": "LOW",
-            "grass_pollen_color": "GREEN",
-            "tree_pollen": 65.0,
-            "tree_pollen_level": "MODERATE",
-            "tree_pollen_color": "YELLOW",
-            "weed_pollen": 0,
-            "weed_pollen_level": "LOW",
-            "weed_pollen_color": "GREEN",
-        }
-        with patch.object(plugin, '_fetch_purpleair_data', return_value=pa_data), \
-             patch.object(plugin, '_fetch_openweathermap_data', return_value=owm_data), \
-             patch.object(plugin, '_fetch_pollen_data', return_value=pollen_data):
-            result = plugin.fetch_data()
-            assert result.available
-            assert result.data["grass_pollen"] == 10.0
-            assert result.data["tree_pollen"] == 65.0
-            assert result.data["weed_pollen"] == 0
-            assert "GRASS:10.0" in result.data["formatted"]
-            assert "TREES:65.0" in result.data["formatted"]
-
-    def test_fetch_data_pollen_only(self, plugin):
-        """Test fetch_data succeeds with only pollen data available."""
-        plugin._config = {}
-        pollen_data = {
-            "grass_pollen": 5.0,
-            "grass_pollen_level": "LOW",
-            "grass_pollen_color": "GREEN",
-            "tree_pollen": 100.0,
-            "tree_pollen_level": "MODERATE",
-            "tree_pollen_color": "YELLOW",
-            "weed_pollen": 25.0,
-            "weed_pollen_level": "MODERATE",
-            "weed_pollen_color": "YELLOW",
-        }
-        with patch.object(plugin, '_fetch_purpleair_data', return_value=None), \
-             patch.object(plugin, '_fetch_openweathermap_data', return_value=None), \
-             patch.object(plugin, '_fetch_pollen_data', return_value=pollen_data):
-            result = plugin.fetch_data()
-            assert result.available
-            assert result.data["grass_pollen"] == 5.0
-            assert result.data["tree_pollen"] == 100.0
-            assert result.data["weed_pollen"] == 25.0
-
-
-class TestPollenLevel:
-    """Tests for pollen level determination in AirFogSource."""
-
-    def test_grass_pollen_low(self):
-        level, color = AirFogSource.determine_pollen_level(
-            10, AirFogSource.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "LOW"
-        assert color == "GREEN"
-
-    def test_grass_pollen_moderate(self):
-        level, color = AirFogSource.determine_pollen_level(
-            50, AirFogSource.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "MODERATE"
-        assert color == "YELLOW"
-
-    def test_grass_pollen_high(self):
-        level, color = AirFogSource.determine_pollen_level(
-            100, AirFogSource.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "HIGH"
-        assert color == "ORANGE"
-
-    def test_grass_pollen_very_high(self):
-        level, color = AirFogSource.determine_pollen_level(
-            300, AirFogSource.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "VERY HIGH"
-        assert color == "RED"
-
-    def test_tree_pollen_low(self):
-        level, color = AirFogSource.determine_pollen_level(
-            30, AirFogSource.TREE_POLLEN_THRESHOLDS
-        )
-        assert level == "LOW"
-        assert color == "GREEN"
-
-    def test_tree_pollen_moderate(self):
-        level, color = AirFogSource.determine_pollen_level(
-            100, AirFogSource.TREE_POLLEN_THRESHOLDS
-        )
-        assert level == "MODERATE"
-        assert color == "YELLOW"
-
-    def test_tree_pollen_high(self):
-        level, color = AirFogSource.determine_pollen_level(
-            500, AirFogSource.TREE_POLLEN_THRESHOLDS
-        )
-        assert level == "HIGH"
-        assert color == "ORANGE"
-
-    def test_tree_pollen_very_high(self):
-        level, color = AirFogSource.determine_pollen_level(
-            800, AirFogSource.TREE_POLLEN_THRESHOLDS
-        )
-        assert level == "VERY HIGH"
-        assert color == "RED"
-
-    def test_weed_pollen_low(self):
-        level, color = AirFogSource.determine_pollen_level(
-            5, AirFogSource.WEED_POLLEN_THRESHOLDS
-        )
-        assert level == "LOW"
-        assert color == "GREEN"
-
-    def test_weed_pollen_moderate(self):
-        level, color = AirFogSource.determine_pollen_level(
-            50, AirFogSource.WEED_POLLEN_THRESHOLDS
-        )
-        assert level == "MODERATE"
-        assert color == "YELLOW"
-
-    def test_pollen_level_negative(self):
-        level, color = AirFogSource.determine_pollen_level(
-            -5, AirFogSource.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "LOW"
-        assert color == "GREEN"
-
-    def test_pollen_level_zero(self):
-        level, color = AirFogSource.determine_pollen_level(
-            0, AirFogSource.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "LOW"
-        assert color == "GREEN"
-
-    def test_pollen_level_boundary_grass_low_moderate(self):
-        """Test boundary between LOW and MODERATE for grass."""
-        level, _ = AirFogSource.determine_pollen_level(
-            20, AirFogSource.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "LOW"
-        level, _ = AirFogSource.determine_pollen_level(
-            21, AirFogSource.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "MODERATE"
-
-    def test_pollen_level_boundary_grass_moderate_high(self):
-        """Test boundary between MODERATE and HIGH for grass."""
-        level, _ = AirFogSource.determine_pollen_level(
-            77, AirFogSource.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "MODERATE"
-        level, _ = AirFogSource.determine_pollen_level(
-            78, AirFogSource.GRASS_POLLEN_THRESHOLDS
-        )
-        assert level == "HIGH"
+    def test_network_error_is_swallowed(self, plugin):
+        plugin.config = {"openweathermap_api_key": "test_key"}
+        with patch("plugins.air_fog.requests.get", side_effect=Exception("Network error")):
+            assert plugin._fetch_openweathermap_data() is None
 
 
 class TestPollenFetch:
-    """Tests for pollen data fetching from Open-Meteo."""
+    """``_fetch_pollen_data`` against Open-Meteo (no key required)."""
 
-    @patch('src.utils.air_fog.requests.get')
-    def test_fetch_pollen_data_success(self, mock_get):
-        """Test successful pollen data fetch."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "current": {
-                "grass_pollen": 15.0,
-                "birch_pollen": 40.0,
-                "alder_pollen": 25.0,
-                "ragweed_pollen": 10.0,
-                "mugwort_pollen": 5.0,
-                "olive_pollen": 20.0,
-            }
-        }
-        mock_get.return_value = mock_response
-
-        source = AirFogSource(latitude=37.7749, longitude=-122.4194)
-        result = source.fetch_pollen_data()
-
-        assert result is not None
+    def test_success_sums_tree_and_weed_species(self, plugin):
+        payload = _pollen(grass=15.0, birch=40.0, alder=25.0, ragweed=10.0, mugwort=5.0, olive=20.0)
+        with patch("plugins.air_fog.requests.get", return_value=_response(payload)):
+            result = plugin._fetch_pollen_data()
         assert result["grass_pollen"] == 15.0
-        assert result["tree_pollen"] == 85.0  # 40 + 25 + 20
-        assert result["weed_pollen"] == 15.0  # 10 + 5
+        assert result["tree_pollen"] == 85.0  # birch + alder + olive
+        assert result["weed_pollen"] == 15.0  # ragweed + mugwort
         assert result["grass_pollen_level"] == "LOW"
         assert result["tree_pollen_level"] == "MODERATE"
         assert result["weed_pollen_level"] == "LOW"
 
-    @patch('src.utils.air_fog.requests.get')
-    def test_fetch_pollen_data_api_error(self, mock_get):
-        """Test handling of Open-Meteo API errors."""
-        mock_get.side_effect = Exception("Network error")
-
-        source = AirFogSource(latitude=37.7749, longitude=-122.4194)
-        result = source.fetch_pollen_data()
-
-        assert result is None
-
-    @patch('src.utils.air_fog.requests.get')
-    def test_fetch_pollen_data_null_values(self, mock_get):
-        """Test pollen data with null/None values from API."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "current": {
-                "grass_pollen": None,
-                "birch_pollen": None,
-                "alder_pollen": None,
-                "ragweed_pollen": None,
-                "mugwort_pollen": None,
-                "olive_pollen": None,
-            }
+    def test_requests_every_species_from_open_meteo(self, plugin):
+        with patch("plugins.air_fog.requests.get", return_value=_response(_pollen())) as get:
+            plugin._fetch_pollen_data()
+        assert get.call_args.args[0] == OPEN_METEO_AIR_QUALITY_URL
+        requested = set(get.call_args.kwargs["params"]["current"].split(","))
+        assert requested == {
+            "grass_pollen",
+            "birch_pollen",
+            "alder_pollen",
+            "ragweed_pollen",
+            "mugwort_pollen",
+            "olive_pollen",
         }
-        mock_get.return_value = mock_response
 
-        source = AirFogSource(latitude=37.7749, longitude=-122.4194)
-        result = source.fetch_pollen_data()
-
-        assert result is not None
-        assert result["grass_pollen"] == 0
-        assert result["tree_pollen"] == 0
-        assert result["weed_pollen"] == 0
+    def test_null_values_count_as_zero(self, plugin):
+        payload = _pollen(grass=None, birch=None, alder=None, ragweed=None, mugwort=None, olive=None)
+        with patch("plugins.air_fog.requests.get", return_value=_response(payload)):
+            result = plugin._fetch_pollen_data()
+        assert (result["grass_pollen"], result["tree_pollen"], result["weed_pollen"]) == (0, 0, 0)
         assert result["grass_pollen_level"] == "LOW"
 
-    @patch('src.utils.air_fog.requests.get')
-    def test_fetch_pollen_data_high_values(self, mock_get):
-        """Test pollen data with high pollen values."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "current": {
-                "grass_pollen": 300.0,
-                "birch_pollen": 400.0,
-                "alder_pollen": 250.0,
-                "ragweed_pollen": 200.0,
-                "mugwort_pollen": 100.0,
-                "olive_pollen": 150.0,
-            }
-        }
-        mock_get.return_value = mock_response
+    def test_empty_current_block_counts_as_zero(self, plugin):
+        with patch("plugins.air_fog.requests.get", return_value=_response({"current": {}})):
+            result = plugin._fetch_pollen_data()
+        assert (result["grass_pollen"], result["tree_pollen"], result["weed_pollen"]) == (0, 0, 0)
 
-        source = AirFogSource(latitude=37.7749, longitude=-122.4194)
-        result = source.fetch_pollen_data()
-
-        assert result is not None
-        assert result["grass_pollen"] == 300.0
+    def test_high_values_are_very_high(self, plugin):
+        payload = _pollen(grass=300.0, birch=400.0, alder=250.0, ragweed=200.0, mugwort=100.0, olive=150.0)
+        with patch("plugins.air_fog.requests.get", return_value=_response(payload)):
+            result = plugin._fetch_pollen_data()
         assert result["grass_pollen_level"] == "VERY HIGH"
         assert result["grass_pollen_color"] == "RED"
-        assert result["tree_pollen"] == 800.0  # 400 + 250 + 150
+        assert result["tree_pollen"] == 800.0
         assert result["tree_pollen_level"] == "VERY HIGH"
-        assert result["weed_pollen"] == 300.0  # 200 + 100
+        assert result["weed_pollen"] == 300.0
         assert result["weed_pollen_level"] == "VERY HIGH"
 
-    @patch('src.utils.air_fog.requests.get')
-    def test_fetch_pollen_data_empty_current(self, mock_get):
-        """Test pollen data with empty current block."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"current": {}}
-        mock_get.return_value = mock_response
+    def test_network_error_is_swallowed(self, plugin):
+        with patch("plugins.air_fog.requests.get", side_effect=Exception("Network error")):
+            assert plugin._fetch_pollen_data() is None
 
-        source = AirFogSource(latitude=37.7749, longitude=-122.4194)
-        result = source.fetch_pollen_data()
 
-        assert result is not None
-        assert result["grass_pollen"] == 0
-        assert result["tree_pollen"] == 0
-        assert result["weed_pollen"] == 0
+class TestFetchData:
+    """``fetch_data`` combines the three upstreams into the template payload."""
 
-    @patch('src.utils.air_fog.requests.get')
-    def test_fetch_air_fog_combined_with_pollen(self, mock_get):
-        """Test combined fetch including pollen data."""
-        def side_effect(url, **kwargs):
-            mock_response = Mock()
-            mock_response.status_code = 200
-
-            if "purpleair" in url:
-                mock_response.json.return_value = {
-                    "sensor": {
-                        "pm2.5_10minute": 10.0,
-                        "humidity": 50,
-                        "temperature": 72
-                    }
-                }
-            elif "openweathermap" in url:
-                mock_response.json.return_value = {
-                    "visibility": 10000,
-                    "main": {"humidity": 50, "temp": 72.0},
-                    "weather": [{"main": "Clear"}]
-                }
-            elif "open-meteo" in url:
-                mock_response.json.return_value = {
-                    "current": {
-                        "grass_pollen": 5.0,
-                        "birch_pollen": 10.0,
-                        "alder_pollen": 8.0,
-                        "ragweed_pollen": 3.0,
-                        "mugwort_pollen": 2.0,
-                        "olive_pollen": 7.0,
-                    }
-                }
-
-            return mock_response
-
-        mock_get.side_effect = side_effect
-
-        source = AirFogSource(
-            purpleair_api_key="purple_key",
-            openweathermap_api_key="owm_key",
-            purpleair_sensor_id="12345"
+    def test_all_three_upstreams(self, plugin):
+        plugin.config = {
+            "purpleair_api_key": "purple_key",
+            "openweathermap_api_key": "owm_key",
+            "purpleair_sensor_id": "12345",
+        }
+        side_effect = _route_by_url(
+            purpleair=_purpleair_sensor(45.0),  # UNHEALTHY_SENSITIVE
+            owm=_owm(1200, 92, 55.0),  # foggy
+            pollen=_pollen(grass=5.0, birch=10.0, alder=8.0, ragweed=3.0, mugwort=2.0, olive=7.0),
         )
-        result = source.fetch_air_fog_data()
+        with patch("plugins.air_fog.requests.get", side_effect=side_effect):
+            result = plugin.fetch_data()
 
-        assert result is not None
-        assert result["pm2_5_aqi"] is not None
-        assert result["grass_pollen"] == 5.0
-        assert result["tree_pollen"] == 25.0  # 10 + 8 + 7
-        assert result["weed_pollen"] == 5.0   # 3 + 2
-        assert "GRASS:5.0" in result["formatted_message"]
-        assert "TREES:25.0" in result["formatted_message"]
+        assert result.available
+        data = result.data
+        assert 101 <= data["aqi"] <= 150
+        assert data["air_status"] == "MODERATE HIGH"
+        assert data["air_color"] == "{64}"
+        assert data["is_foggy"] == "Yes"
+        assert data["fog_status"] == "FOG"
+        assert data["fog_color"] == "{64}"
+        assert data["visibility"] == "0.7mi"
+        assert data["grass_pollen"] == 5.0
+        assert data["tree_pollen"] == 25.0
+        assert data["weed_pollen"] == 5.0
+        assert data["formatted"] == f"AQI:{data['aqi']} VIS:0.7mi GRASS:5.0 TREES:25.0 WEEDS:5.0"
 
-    @patch('src.utils.air_fog.requests.get')
-    def test_fetch_air_fog_pollen_only(self, mock_get):
-        """Test combined fetch with only pollen data available."""
-        def side_effect(url, **kwargs):
-            mock_response = Mock()
-            mock_response.status_code = 200
+    def test_payload_keys_match_manifest_variables(self, plugin):
+        """Every variable the manifest declares is produced, and nothing else."""
+        plugin.config = {"purpleair_api_key": "k", "openweathermap_api_key": "k", "purpleair_sensor_id": "1"}
+        side_effect = _route_by_url(
+            purpleair=_purpleair_sensor(10.0), owm=_owm(10000, 50, 70.0), pollen=_pollen()
+        )
+        with patch("plugins.air_fog.requests.get", side_effect=side_effect):
+            data = plugin.fetch_data().data
+        assert set(data) == set(_manifest()["variables"]["simple"])
 
-            if "open-meteo" in url:
-                mock_response.json.return_value = {
-                    "current": {
-                        "grass_pollen": 50.0,
-                        "birch_pollen": 0,
-                        "alder_pollen": 0,
-                        "ragweed_pollen": 0,
-                        "mugwort_pollen": 0,
-                        "olive_pollen": 0,
-                    }
-                }
-            else:
-                raise Exception("No API key")
+    def test_pollen_only_when_no_keys_configured(self, plugin):
+        """Open-Meteo needs no key, so a keyless config still yields pollen."""
+        plugin.config = {}
+        side_effect = _route_by_url(pollen=_pollen(grass=50.0))
+        with patch("plugins.air_fog.requests.get", side_effect=side_effect) as get:
+            result = plugin.fetch_data()
 
-            return mock_response
+        assert result.available
+        assert get.call_count == 1  # only Open-Meteo was asked
+        assert result.data["grass_pollen"] == 50.0
+        assert result.data["grass_pollen_level"] == "MODERATE"
+        assert result.data["aqi"] is None
+        assert result.data["air_status"] == "UNKNOWN"
+        assert result.data["fog_status"] == "UNKNOWN"
+        assert result.data["formatted"] == "GRASS:50.0 TREES:0 WEEDS:0"
 
-        mock_get.side_effect = side_effect
+    def test_air_and_fog_without_pollen(self, plugin):
+        plugin.config = {"purpleair_api_key": "k", "openweathermap_api_key": "k", "purpleair_sensor_id": "1"}
+        side_effect = _route_by_url(purpleair=_purpleair_sensor(20.0), owm=_owm(5000, 75, 62.5))
+        with patch("plugins.air_fog.requests.get", side_effect=side_effect):
+            result = plugin.fetch_data()
 
-        source = AirFogSource()
-        result = source.fetch_air_fog_data()
+        assert result.available
+        assert result.data["aqi"] == 68
+        assert result.data["air_status"] == "MODERATE"
+        assert result.data["visibility"] == "3.1mi"
+        assert result.data["is_foggy"] == "No"
+        assert result.data["grass_pollen"] is None
+        assert result.data["grass_pollen_level"] == "UNKNOWN"
+        assert result.data["formatted"] == "AQI:68 VIS:3.1mi"
 
-        assert result is not None
-        assert result["grass_pollen"] == 50.0
-        assert result["grass_pollen_level"] == "MODERATE"
+    def test_every_upstream_failing_is_unavailable(self, plugin):
+        plugin.config = {"purpleair_api_key": "k", "openweathermap_api_key": "k"}
+        with patch("plugins.air_fog.requests.get", side_effect=Exception("down")):
+            result = plugin.fetch_data()
+        assert not result.available
+        assert result.data is None
+        assert result.error == "Failed to fetch data from any source"
+
+    def test_one_failing_upstream_does_not_take_the_others_down(self, plugin):
+        plugin.config = {"purpleair_api_key": "k", "openweathermap_api_key": "k", "purpleair_sensor_id": "1"}
+        side_effect = _route_by_url(owm=_owm(10000, 50, 70.0), pollen=_pollen())  # PurpleAir raises
+        with patch("plugins.air_fog.requests.get", side_effect=side_effect):
+            result = plugin.fetch_data()
+        assert result.available
+        assert result.data["aqi"] is None
+        assert result.data["fog_status"] == "CLEAR"
+        assert result.data["fog_color"] == "{66}"
 
 
-MANIFEST_PATH = Path(__file__).resolve().parent.parent / "manifest.json"
-
-REQUIRED_VAR_FIELDS = {"description", "type", "max_length", "group", "example"}
+MANIFEST_REQUIRED_VAR_FIELDS = {"description", "type", "max_length", "group", "example"}
 
 EXPECTED_SIMPLE_VARS = [
     "aqi", "air_status", "air_color",
@@ -1479,8 +676,7 @@ class TestManifestMetadata:
 
     @pytest.fixture(autouse=True)
     def load_manifest(self):
-        with open(MANIFEST_PATH) as f:
-            self.manifest = json.load(f)
+        self.manifest = _manifest()
         self.variables = self.manifest["variables"]
         self.simple = self.variables["simple"]
         self.groups = self.variables["groups"]
@@ -1500,7 +696,7 @@ class TestManifestMetadata:
 
     def test_each_variable_has_required_fields(self):
         for var_name, meta in self.simple.items():
-            missing = REQUIRED_VAR_FIELDS - set(meta.keys())
+            missing = MANIFEST_REQUIRED_VAR_FIELDS - set(meta.keys())
             assert not missing, f"{var_name} missing fields: {missing}"
 
     def test_groups_section_exists(self):
@@ -1523,12 +719,9 @@ class TestManifestMetadata:
     def test_type_values_are_valid(self):
         allowed = {"string", "number", "boolean"}
         for var_name, meta in self.simple.items():
-            assert meta["type"] in allowed, (
-                f"{var_name}: invalid type '{meta['type']}'"
-            )
+            assert meta["type"] in allowed, f"{var_name}: invalid type '{meta['type']}'"
 
     def test_no_old_max_lengths_key(self):
         assert "max_lengths" not in self.manifest, (
             "Old top-level max_lengths key should be removed"
         )
-

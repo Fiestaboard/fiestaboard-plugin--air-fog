@@ -1,0 +1,15 @@
+# Coverage is a gate on *this plugin's* code.
+#
+# `pytest --cov=.` would otherwise measure two things that make the gate
+# meaningless:
+#   - fiestaboard-core/  : the core checkout CI clones so the plugin can import
+#                          PluginBase. Not our code.
+#   - tests/             : test files are ~100% covered by definition, and there
+#                          are far more test statements than plugin statements,
+#                          so including them floats the total above the
+#                          threshold no matter what __init__.py does.
+# What is left is __init__.py — the plugin.
+[run]
+omit =
+    fiestaboard-core/*
+    tests/*
